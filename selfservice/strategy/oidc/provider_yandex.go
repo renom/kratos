@@ -80,10 +80,13 @@ func (g *ProviderYandex) Claims(ctx context.Context, exchange *oauth2.Token, que
 	}
 
 	var user struct {
-		Id           string `json:"id,omitempty"`
-		FirstName    string `json:"first_name,omitempty"`
-		LastName     string `json:"last_name,omitempty"`
-		Email        string `json:"default_email,omitempty"`
+		Id        string `json:"id,omitempty"`
+		FirstName string `json:"first_name,omitempty"`
+		LastName  string `json:"last_name,omitempty"`
+		Email     string `json:"default_email,omitempty"`
+		Phone     struct {
+			Number string `json:"number,omitempty"`
+		} `json:"default_phone,omitempty"`
 		Picture      string `json:"default_avatar_id,omitempty"`
 		PictureEmpty bool   `json:"is_avatar_empty,omitempty"`
 		Gender       string `json:"sex,omitempty"`
@@ -101,13 +104,14 @@ func (g *ProviderYandex) Claims(ctx context.Context, exchange *oauth2.Token, que
 	}
 
 	return &Claims{
-		Issuer:     "https://login.yandex.ru/info",
-		Subject:    user.Id,
-		GivenName:  user.FirstName,
-		FamilyName: user.LastName,
-		Picture:    user.Picture,
-		Email:      user.Email,
-		Gender:     user.Gender,
-		Birthdate:  user.BirthDay,
+		Issuer:      "https://login.yandex.ru/info",
+		Subject:     user.Id,
+		GivenName:   user.FirstName,
+		FamilyName:  user.LastName,
+		Picture:     user.Picture,
+		Email:       user.Email,
+		PhoneNumber: user.Phone.Number,
+		Gender:      user.Gender,
+		Birthdate:   user.BirthDay,
 	}, nil
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
 
@@ -88,6 +89,7 @@ func (g *ProviderVK) Claims(ctx context.Context, exchange *oauth2.Token, query u
 		Nickname  string `json:"nickname,omitempty"`
 		Picture   string `json:"photo_200,omitempty"`
 		Email     string `json:"-"`
+		Phone     string `json:"-"`
 		Gender    int    `json:"sex,omitempty"`
 		BirthDay  string `json:"bdate,omitempty"`
 	}
@@ -110,6 +112,10 @@ func (g *ProviderVK) Claims(ctx context.Context, exchange *oauth2.Token, query u
 		user.Email = email
 	}
 
+	if phone, ok := exchange.Extra("phone").(string); ok {
+		user.Phone = "+" + phone
+	}
+
 	gender := ""
 	switch user.Gender {
 	case 1:
@@ -118,15 +124,22 @@ func (g *ProviderVK) Claims(ctx context.Context, exchange *oauth2.Token, query u
 		gender = "male"
 	}
 
+	t, err := time.Parse("2.1.2006", user.BirthDay)
+	if err != nil {
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+	}
+	birthDay := t.Format("2006-01-02")
+
 	return &Claims{
-		Issuer:     "https://api.vk.com/method/users.get",
-		Subject:    strconv.Itoa(user.Id),
-		GivenName:  user.FirstName,
-		FamilyName: user.LastName,
-		Nickname:   user.Nickname,
-		Picture:    user.Picture,
-		Email:      user.Email,
-		Gender:     gender,
-		Birthdate:  user.BirthDay,
+		Issuer:      "https://api.vk.com/method/users.get",
+		Subject:     strconv.Itoa(user.Id),
+		GivenName:   user.FirstName,
+		FamilyName:  user.LastName,
+		Nickname:    user.Nickname,
+		Picture:     user.Picture,
+		Email:       user.Email,
+		PhoneNumber: user.Phone,
+		Gender:      gender,
+		Birthdate:   birthDay,
 	}, nil
 }
