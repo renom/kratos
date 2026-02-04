@@ -42,8 +42,8 @@ func (s *Strategy) handleLoginError(r *http.Request, f *login.Flow, payload upda
 	return err
 }
 
-func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, _ *session.Session) (_ *identity.Identity, err error) {
-	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.link.strategy.Login")
+func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, sess *session.Session) (_ *identity.Identity, err error) {
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.idfirst.Strategy.Login")
 	defer otelx.End(span, &err)
 
 	if !s.d.Config().SelfServiceLoginFlowIdentifierFirstEnabled(ctx) {
@@ -99,7 +99,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	opts = append(opts, login.WithIdentifier(p.Identifier))
 
 	didPopulate := false
-	for _, ls := range s.d.LoginStrategies(ctx) {
+	for _, ls := range s.d.LoginStrategies(ctx, login.PrepareOrganizations(r, f, sess)...) {
 		populator, ok := ls.(login.FormHydrator)
 		if !ok {
 			continue
@@ -136,6 +136,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		if !ok {
 			continue
 		}
+		attrs.Autocomplete = node.InputAttributeAutocompleteUsernameWebauthn
 
 		attrs.Type = node.InputAttributeTypeHidden
 		f.UI.Nodes[k].Attributes = attrs
@@ -155,7 +156,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	return nil, flow.ErrCompletedByStrategy
 }
 
-func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, sr *login.Flow) error {
+func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, sr *login.Flow, _ *session.Session) error {
 	return nil
 }
 
@@ -174,7 +175,7 @@ func (s *Strategy) PopulateLoginMethodSecondFactorRefresh(r *http.Request, sr *l
 func (s *Strategy) PopulateLoginMethodIdentifierFirstIdentification(r *http.Request, f *login.Flow) error {
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -184,7 +185,10 @@ func (s *Strategy) PopulateLoginMethodIdentifierFirstIdentification(r *http.Requ
 		return err
 	}
 
-	f.UI.SetNode(node.NewInputField("identifier", "", s.NodeGroup(), node.InputAttributeTypeText, node.WithRequiredInputAttribute).WithMetaLabel(identifierLabel))
+	f.UI.SetNode(node.NewInputField("identifier", "", s.NodeGroup(), node.InputAttributeTypeText, node.WithInputAttributes(func(a *node.InputAttributes) {
+		a.Autocomplete = node.InputAttributeAutocompleteUsernameWebauthn
+		a.Required = true
+	})).WithMetaLabel(identifierLabel))
 	f.UI.GetNodes().Append(node.NewInputField("method", s.ID(), s.NodeGroup(), node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoNodeLabelContinue()))
 	return nil
 }

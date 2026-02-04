@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/pkg/errors"
@@ -18,8 +21,6 @@ import (
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/urlx"
-
-	"github.com/julienschmidt/httprouter"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/selfservice/errorx"
@@ -36,7 +37,7 @@ const (
 type (
 	handlerDependencies interface {
 		x.WriterProvider
-		x.CSRFProvider
+		nosurfx.CSRFProvider
 		session.ManagementProvider
 		session.PersistenceProvider
 		errorx.ManagementProvider
@@ -67,9 +68,9 @@ func (h *Handler) RegisterPublicRoutes(router *x.RouterPublic) {
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
-	admin.GET(RouteInitBrowserFlow, x.RedirectToPublicRoute(h.d))
-	admin.DELETE(RouteAPIFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
+	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
+	admin.DELETE(RouteAPIFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
 }
 
 // Logout Flow
@@ -138,7 +139,7 @@ type createBrowserLogoutFlow struct {
 //	  400: errorGeneric
 //	  401: errorGeneric
 //	  500: errorGeneric
-func (h *Handler) createBrowserLogoutFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) createBrowserLogoutFlow(w http.ResponseWriter, r *http.Request) {
 	sess, err := h.d.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
@@ -153,11 +154,11 @@ func (h *Handler) createBrowserLogoutFlow(w http.ResponseWriter, r *http.Request
 
 	if requestURL.Query().Get("return_to") != "" {
 		// Pre-validate the return to URL which is contained in the HTTP request.
-		returnTo, err = x.SecureRedirectTo(r,
+		returnTo, err = redir.SecureRedirectTo(r,
 			h.d.Config().SelfServiceFlowLogoutRedirectURL(r.Context()),
-			x.SecureRedirectUseSourceURL(requestURL.String()),
-			x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
-			x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
+			redir.SecureRedirectUseSourceURL(requestURL.String()),
+			redir.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
+			redir.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
 		)
 		if err != nil {
 			h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
@@ -229,7 +230,7 @@ type performNativeLogoutBody struct {
 //	  204: emptyResponse
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) performNativeLogout(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) performNativeLogout(w http.ResponseWriter, r *http.Request) {
 	var p performNativeLogoutBody
 	if err := h.dx.Decode(r, &p,
 		decoderx.HTTPJSONDecoder(),
@@ -320,7 +321,7 @@ type updateLogoutFlow struct {
 //	  303: emptyResponse
 //	  204: emptyResponse
 //	  default: errorGeneric
-func (h *Handler) updateLogoutFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) updateLogoutFlow(w http.ResponseWriter, r *http.Request) {
 	expected := r.URL.Query().Get("token")
 	if len(expected) == 0 {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReason("Please include a token in the URL query.")))
@@ -354,10 +355,10 @@ func (h *Handler) updateLogoutFlow(w http.ResponseWriter, r *http.Request, ps ht
 func (h *Handler) completeLogout(w http.ResponseWriter, r *http.Request) {
 	_ = h.d.CSRFHandler().RegenerateToken(w, r)
 
-	ret, err := x.SecureRedirectTo(r, h.d.Config().SelfServiceFlowLogoutRedirectURL(r.Context()),
-		x.SecureRedirectUseSourceURL(r.RequestURI),
-		x.SecureRedirectAllowURLs(h.d.Config().SelfServiceBrowserAllowedReturnToDomains(r.Context())),
-		x.SecureRedirectAllowSelfServiceURLs(h.d.Config().SelfPublicURL(r.Context())),
+	ret, err := redir.SecureRedirectTo(r, h.d.Config().SelfServiceFlowLogoutRedirectURL(r.Context()),
+		redir.SecureRedirectUseSourceURL(r.RequestURI),
+		redir.SecureRedirectAllowURLs(h.d.Config().SelfServiceBrowserAllowedReturnToDomains(r.Context())),
+		redir.SecureRedirectAllowSelfServiceURLs(h.d.Config().SelfPublicURL(r.Context())),
 	)
 	if err != nil {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)

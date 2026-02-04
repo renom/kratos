@@ -6,10 +6,10 @@ package devices
 import (
 	"context"
 
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 
 	"github.com/ory/kratos/session"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"

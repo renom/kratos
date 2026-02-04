@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/pkg/errors"
 	"github.com/pquerna/otp"
 
@@ -33,8 +35,8 @@ var (
 type totpStrategyDependencies interface {
 	x.LoggingProvider
 	x.WriterProvider
-	x.CSRFTokenGeneratorProvider
-	x.CSRFProvider
+	nosurfx.CSRFTokenGeneratorProvider
+	nosurfx.CSRFProvider
 	x.TracingProvider
 
 	config.Provider
@@ -74,9 +76,9 @@ type Strategy struct {
 	hd *decoderx.HTTP
 }
 
-func NewStrategy(d any) *Strategy {
+func NewStrategy(d totpStrategyDependencies) *Strategy {
 	return &Strategy{
-		d:  d.(totpStrategyDependencies),
+		d:  d,
 		hd: decoderx.NewHTTP(),
 	}
 }

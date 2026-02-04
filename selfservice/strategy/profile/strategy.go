@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/ory/x/otelx"
 
 	"github.com/ory/jsonschema/v3"
@@ -38,8 +40,8 @@ var _ settings.Strategy = new(Strategy)
 
 type (
 	strategyDependencies interface {
-		x.CSRFProvider
-		x.CSRFTokenGeneratorProvider
+		nosurfx.CSRFProvider
+		nosurfx.CSRFTokenGeneratorProvider
 		x.WriterProvider
 		x.LoggingProvider
 		x.TracingProvider
@@ -64,6 +66,7 @@ type (
 		settings.HooksProvider
 
 		registration.FlowPersistenceProvider
+		registration.StrategyProvider
 
 		schema.IdentitySchemaProvider
 	}
@@ -73,8 +76,8 @@ type (
 	}
 )
 
-func NewStrategy(d any) *Strategy {
-	return &Strategy{d: d.(strategyDependencies), dc: decoderx.NewHTTP()}
+func NewStrategy(d strategyDependencies) *Strategy {
+	return &Strategy{d: d, dc: decoderx.NewHTTP()}
 }
 
 func (s *Strategy) SettingsStrategyID() string {
@@ -83,8 +86,11 @@ func (s *Strategy) SettingsStrategyID() string {
 
 func (s *Strategy) RegisterSettingsRoutes(_ *x.RouterPublic) {}
 
-func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity, f *settings.Flow) error {
-	schemas, err := s.d.IdentityTraitsSchemas(r.Context())
+func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, id *identity.Identity, f *settings.Flow) (err error) {
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.profile.Strategy.PopulateSettingsMethod")
+	defer otelx.End(span, &err)
+
+	schemas, err := s.d.IdentityTraitsSchemas(ctx)
 	if err != nil {
 		return err
 	}
@@ -96,7 +102,7 @@ func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity
 
 	// use a schema compiler that disables identifiers
 	schemaCompiler := jsonschema.NewCompiler()
-	nodes, err := container.NodesFromJSONSchema(r.Context(), node.ProfileGroup, traitsSchema.URL.String(), "", schemaCompiler)
+	nodes, err := container.NodesFromJSONSchema(ctx, node.ProfileGroup, traitsSchema.URL.String(), "", schemaCompiler)
 	if err != nil {
 		return err
 	}
@@ -112,8 +118,8 @@ func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity
 	return nil
 }
 
-func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (_ *settings.UpdateContext, err error) {
-	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.profile.strategy.Settings")
+func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (_ *settings.UpdateContext, err error) {
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.profile.Strategy.Settings")
 	defer otelx.End(span, &err)
 
 	var p updateSettingsFlowWithProfileMethod
@@ -121,7 +127,7 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
 		return ctxUpdate, s.continueFlow(ctx, r, ctxUpdate, p)
 	} else if err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	if err := flow.MethodEnabledAndAllowedFromRequest(r, f.GetFlowName(), s.SettingsStrategyID(), s.d); err != nil {
@@ -130,7 +136,7 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 
 	option, err := s.newSettingsProfileDecoder(ctx, ctxUpdate.GetSessionIdentity())
 	if err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	if err := s.dc.Decode(r, &p, option,
@@ -138,14 +144,14 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 		decoderx.HTTPDecoderSetValidatePayloads(true),
 		decoderx.HTTPDecoderJSONFollowsFormFormat(),
 	); err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	// Reset after decoding form
 	p.SetFlowID(ctxUpdate.Flow.ID)
 
 	if err := s.continueFlow(ctx, r, ctxUpdate, p); err != nil {
-		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, nil, p, err)
+		return ctxUpdate, s.handleSettingsError(ctx, w, r, ctxUpdate, nil, p, err)
 	}
 
 	return ctxUpdate, nil
@@ -243,9 +249,9 @@ func (s *Strategy) hydrateForm(r *http.Request, ar *settings.Flow, traits json.R
 
 // handleSettingsError is a convenience function for handling all types of errors that may occur (e.g. validation error)
 // during a settings request.
-func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, puc *settings.UpdateContext, traits json.RawMessage, p updateSettingsFlowWithProfileMethod, err error) error {
+func (s *Strategy) handleSettingsError(ctx context.Context, w http.ResponseWriter, r *http.Request, puc *settings.UpdateContext, traits json.RawMessage, p updateSettingsFlowWithProfileMethod, err error) error {
 	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) {
-		if err := s.d.ContinuityManager().Pause(r.Context(), w, r,
+		if err := s.d.ContinuityManager().Pause(ctx, w, r,
 			settings.ContinuityKey(s.SettingsStrategyID()),
 			settings.ContinuityOptions(p, puc.GetSessionIdentity())...); err != nil {
 			return err
@@ -296,4 +302,19 @@ func (s *Strategy) newSettingsProfileDecoder(ctx context.Context, i *identity.Id
 
 func (s *Strategy) NodeGroup() node.UiNodeGroup {
 	return node.ProfileGroup
+}
+
+// SortForHydration sorts the strategies so that the profile strategy is always first.
+func SortForHydration(strats registration.Strategies) registration.Strategies {
+	sorted := make(registration.Strategies, len(strats))
+	copy(sorted, strats)
+
+	for i, strat := range sorted {
+		if strat.ID() == identity.CredentialsTypeProfile {
+			sorted = append([]registration.Strategy{strat}, append(sorted[:i], sorted[i+1:]...)...)
+			break
+		}
+	}
+
+	return sorted
 }

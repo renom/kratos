@@ -28,6 +28,7 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/assertx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/ioutilx"
@@ -35,15 +36,12 @@ import (
 )
 
 func setupServer(t *testing.T, reg *driver.RegistryDefault) *httptest.Server {
-	conf := reg.Config()
-	router := x.NewRouterPublic()
-	admin := x.NewRouterAdmin()
-
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, admin)
+	publicTS, _ := testhelpers.NewKratosServer(t, reg)
 	redirTS := testhelpers.NewRedirSessionEchoTS(t, reg)
-	ctx := context.Background()
-	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, redirTS.URL+"/default-return-to")
-	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+"."+config.DefaultBrowserReturnURL, redirTS.URL+"/registration-return-ts")
+
+	conf := reg.Config()
+	conf.MustSet(t.Context(), config.ViperKeySelfServiceBrowserDefaultReturnTo, redirTS.URL+"/default-return-to")                                    //nolint:staticcheck
+	conf.MustSet(t.Context(), config.ViperKeySelfServiceRegistrationAfter+"."+config.DefaultBrowserReturnURL, redirTS.URL+"/registration-return-ts") //nolint:staticcheck
 	return publicTS
 }
 
@@ -93,7 +91,7 @@ var skipIfNotEnabled = func(t *testing.T, flows []string, flow string) {
 	}
 }
 
-func AssertSchemDoesNotExist(t *testing.T, reg *driver.RegistryDefault, flows []string, payload func(v url.Values)) {
+func AssertSchemaDoesNotExist(t *testing.T, reg *driver.RegistryDefault, flows []string, payload func(v url.Values)) {
 	conf := reg.Config()
 	_ = testhelpers.NewRegistrationUIFlowEchoServer(t, reg)
 	publicTS := setupServer(t, reg)
@@ -115,7 +113,7 @@ func AssertSchemDoesNotExist(t *testing.T, reg *driver.RegistryDefault, flows []
 		values := url.Values{
 			"traits.username": {testhelpers.RandomEmail()},
 			"traits.foobar":   {"bar"},
-			"csrf_token":      {x.FakeCSRFToken},
+			"csrf_token":      {nosurfx.FakeCSRFToken},
 		}
 		payload(values)
 
@@ -180,7 +178,7 @@ func AssertCSRFFailures(t *testing.T, reg *driver.RegistryDefault, flows []strin
 
 		actual, res := testhelpers.RegistrationMakeRequest(t, false, false, f, browserClient, values.Encode())
 		assert.EqualValues(t, http.StatusOK, res.StatusCode)
-		assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken,
+		assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken,
 			json.RawMessage(actual), "%s", actual)
 	})
 
@@ -192,7 +190,7 @@ func AssertCSRFFailures(t *testing.T, reg *driver.RegistryDefault, flows []strin
 
 		actual, res := testhelpers.RegistrationMakeRequest(t, false, true, f, browserClient, values.Encode())
 		assert.EqualValues(t, http.StatusForbidden, res.StatusCode)
-		assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken,
+		assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken,
 			json.RawMessage(gjson.Get(actual, "error").Raw), "%s", actual)
 	})
 
@@ -235,7 +233,7 @@ func AssertCSRFFailures(t *testing.T, reg *driver.RegistryDefault, flows []strin
 
 				res, err := apiClient.Do(req)
 				require.NoError(t, err)
-				defer res.Body.Close()
+				defer func() { _ = res.Body.Close() }()
 
 				actual := string(ioutilx.MustReadAll(res.Body))
 				assert.EqualValues(t, http.StatusBadRequest, res.StatusCode)
@@ -291,7 +289,7 @@ func AssertCommonErrorCases(t *testing.T, flows []string) {
 			res, err := testhelpers.NewHTTPClientWithArbitrarySessionCookie(t, ctx, reg).
 				Do(httpx.MustNewRequest("POST", publicTS.URL+registration.RouteSubmitFlow, strings.NewReader(values.Encode()), "application/x-www-form-urlencoded"))
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.EqualValues(t, http.StatusOK, res.StatusCode, "%+v", res.Request)
 			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceBrowserDefaultReturnTo))
 		})
@@ -301,7 +299,7 @@ func AssertCommonErrorCases(t *testing.T, flows []string) {
 				Do(httpx.MustNewRequest("POST", publicTS.URL+registration.RouteSubmitFlow, strings.NewReader(testhelpers.EncodeFormAsJSON(t, true, values)), "application/json"))
 			require.NoError(t, err)
 			assert.Len(t, res.Cookies(), 0)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assertx.EqualAsJSON(t, registration.ErrAlreadyLoggedIn, json.RawMessage(gjson.GetBytes(ioutilx.MustReadAll(res.Body), "error").Raw))
 		})
 	})
@@ -340,7 +338,7 @@ func AssertCommonErrorCases(t *testing.T, flows []string) {
 			res, err := testhelpers.NewHTTPClientWithArbitrarySessionCookie(t, ctx, reg).
 				Do(httpx.MustNewRequest("POST", publicTS.URL+registration.RouteSubmitFlow, strings.NewReader(values.Encode()), "application/x-www-form-urlencoded"))
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.EqualValues(t, http.StatusOK, res.StatusCode, "%+v", res.Request)
 			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceBrowserDefaultReturnTo))
 		})
@@ -350,7 +348,7 @@ func AssertCommonErrorCases(t *testing.T, flows []string) {
 				Do(httpx.MustNewRequest("POST", publicTS.URL+registration.RouteSubmitFlow, strings.NewReader(testhelpers.EncodeFormAsJSON(t, true, values)), "application/json"))
 			require.NoError(t, err)
 			assert.Len(t, res.Cookies(), 0)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assertx.EqualAsJSON(t, registration.ErrAlreadyLoggedIn, json.RawMessage(gjson.GetBytes(ioutilx.MustReadAll(res.Body), "error").Raw))
 		})
 	})

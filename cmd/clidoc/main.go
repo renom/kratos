@@ -47,7 +47,8 @@ func init() {
 		"NewInfoNodeLabelVerificationCode":           text.NewInfoNodeLabelVerificationCode(),
 		"NewInfoNodeLabelRecoveryCode":               text.NewInfoNodeLabelRecoveryCode(),
 		"NewInfoNodeInputPassword":                   text.NewInfoNodeInputPassword(),
-		"NewInfoNodeLabelGenerated":                  text.NewInfoNodeLabelGenerated("{title}"),
+		"NewInfoNodeInputPhoneNumber":                text.NewInfoNodeInputPhoneNumber(),
+		"NewInfoNodeLabelGenerated":                  text.NewInfoNodeLabelGenerated("{title}", "{name}"),
 		"NewInfoNodeLabelSave":                       text.NewInfoNodeLabelSave(),
 		"NewInfoNodeLabelSubmit":                     text.NewInfoNodeLabelSubmit(),
 		"NewInfoNodeLabelID":                         text.NewInfoNodeLabelID(),
@@ -103,6 +104,7 @@ func init() {
 		"NewErrorValidationPasswordMinLength":                     text.NewErrorValidationPasswordMinLength(6, 5),
 		"NewErrorValidationPasswordMaxLength":                     text.NewErrorValidationPasswordMaxLength(72, 80),
 		"NewErrorValidationPasswordTooManyBreaches":               text.NewErrorValidationPasswordTooManyBreaches(101),
+		"NewErrorValidationPasswordNewSameAsOld":                  text.NewErrorValidationPasswordNewSameAsOld(),
 		"NewErrorValidationInvalidCredentials":                    text.NewErrorValidationInvalidCredentials(),
 		"NewErrorValidationDuplicateCredentials":                  text.NewErrorValidationDuplicateCredentials(),
 		"NewErrorValidationDuplicateCredentialsWithHints":         text.NewErrorValidationDuplicateCredentialsWithHints([]string{"{available_credential_types_list}"}, []string{"{available_oidc_providers_list}"}, "{credential_identifier_hint}"),
@@ -144,6 +146,11 @@ func init() {
 		"NewRecoverySuccessful":                                   text.NewRecoverySuccessful(inAMinute),
 		"NewRecoveryEmailSent":                                    text.NewRecoveryEmailSent(),
 		"NewRecoveryEmailWithCodeSent":                            text.NewRecoveryEmailWithCodeSent(),
+		"NewRecoveryCodeRecoverySelectAddressSent":                text.NewRecoveryCodeRecoverySelectAddressSent("{masked_address}"),
+		"NewRecoveryAskAnyRecoveryAddress":                        text.NewRecoveryAskAnyRecoveryAddress(),
+		"NewRecoveryAskForFullAddress":                            text.NewRecoveryAskForFullAddress(),
+		"NewRecoveryAskToChooseAddress":                           text.NewRecoveryAskToChooseAddress(),
+		"NewRecoveryBack":                                         text.NewRecoveryBack(),
 		"NewErrorValidationRecoveryTokenInvalidOrAlreadyUsed":     text.NewErrorValidationRecoveryTokenInvalidOrAlreadyUsed(),
 		"NewErrorValidationRecoveryCodeInvalidOrAlreadyUsed":      text.NewErrorValidationRecoveryCodeInvalidOrAlreadyUsed(),
 		"NewErrorValidationRecoveryRetrySuccess":                  text.NewErrorValidationRecoveryRetrySuccess(),
@@ -185,7 +192,7 @@ func init() {
 }
 
 func main() {
-	if err := clidoc.Generate(cmd.NewRootCmd(), []string{filepath.Join(os.Args[2], "cli")}); err != nil {
+	if err := clidoc.Generate(cmd.NewRootCmd(nil, nil), []string{filepath.Join(os.Args[2], "cli")}); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Unable to generate CLI docs: %+v", err)
 		os.Exit(1)
 	}
@@ -243,7 +250,7 @@ func sortMessages() []*text.Message {
 }
 
 func writeMessages(path string, sortedMessages []*text.Message) error {
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(path) // #nosec G304 -- path is supplied by us
 	if err != nil {
 		return err
 	}
@@ -260,7 +267,7 @@ func writeMessages(path string, sortedMessages []*text.Message) error {
 	r := regexp.MustCompile(`(?s)<!-- START MESSAGE TABLE -->(.*?)<!-- END MESSAGE TABLE -->`)
 	result := r.ReplaceAllString(string(content), "<!-- START MESSAGE TABLE -->\n"+w.String()+"\n<!-- END MESSAGE TABLE -->")
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec
 	if err != nil {
 		return err
 	}
@@ -279,7 +286,7 @@ func writeMessages(path string, sortedMessages []*text.Message) error {
 func writeMessagesJson(path string, sortedMessages []*text.Message) error {
 	result := codeEncode(sortedMessages)
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644) // #nosec
 	if err != nil {
 		return err
 	}
@@ -309,6 +316,8 @@ func validateAllMessages(path string) error {
 	info := &types.Info{
 		Defs: make(map[*ast.Ident]types.Object),
 	}
+
+	//nolint:staticcheck
 	var pack *ast.Package
 	for _, p := range packs {
 		if p.Name == "text" {

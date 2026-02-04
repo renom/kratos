@@ -46,8 +46,23 @@ func TestRecoveryAddress_Hash(t *testing.T) {
 			name: "empty fields",
 			a:    RecoveryAddress{},
 		}, {
-			name: "constructor",
+			name: "email constructor",
 			a:    *NewRecoveryEmailAddress("foo@ory.sh", x.NewUUID()),
+		},
+		{
+			name: "full fields",
+			a: RecoveryAddress{
+				ID:         x.NewUUID(),
+				Value:      "6502530000",
+				Via:        AddressTypeSMS,
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+				IdentityID: x.NewUUID(),
+				NID:        x.NewUUID(),
+			},
+		}, {
+			name: "SMS constructor",
+			a:    *NewRecoverySMSAddress("6502530000", x.NewUUID()),
 		},
 	}
 
@@ -55,7 +70,7 @@ func TestRecoveryAddress_Hash(t *testing.T) {
 		t.Run("case="+tc.name, func(t *testing.T) {
 			assert.Equal(t,
 				reflectiveHash(tc.a),
-				tc.a.Hash(),
+				tc.a.Signature(),
 			)
 		})
 	}

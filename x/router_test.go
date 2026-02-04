@@ -8,70 +8,88 @@ import (
 	"testing"
 
 	"github.com/gobuffalo/httptest"
-	"github.com/julienschmidt/httprouter"
+	"github.com/urfave/negroni"
+
+	"github.com/ory/x/httprouterx"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestNewRouterAdmin(t *testing.T) {
-	require.NotEmpty(t, NewRouterAdmin())
-	require.NotEmpty(t, NewRouterPublic())
+	require.NotEmpty(t, NewTestRouterAdmin(t))
+	require.NotEmpty(t, NewTestRouterPublic(t))
 }
 
 func TestCacheHandling(t *testing.T) {
-	router := NewRouterPublic()
+	router := NewTestRouterPublic(t)
 	ts := httptest.NewServer(router)
 	t.Cleanup(ts.Close)
 
-	router.GET("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.DELETE("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("DELETE /foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.POST("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("POST /foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.PUT("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("PUT /foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.PATCH("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("PATCH /foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	for _, method := range []string{} {
+	for _, method := range []string{"GET", "DELETE", "POST", "PUT", "PATCH"} {
 		req, _ := http.NewRequest(method, ts.URL+"/foo", nil)
 		res, err := ts.Client().Do(req)
 		require.NoError(t, err)
-		assert.EqualValues(t, "0", res.Header.Get("Cache-Control"))
+		assert.EqualValues(t, "private, no-cache, no-store, must-revalidate", res.Header.Get("Cache-Control"))
 	}
 }
 
 func TestAdminPrefix(t *testing.T) {
-	router := NewRouterAdmin()
-	ts := httptest.NewServer(router)
+	n := negroni.New()
+	n.UseFunc(httprouterx.TrimTrailingSlashNegroni)
+	n.UseFunc(httprouterx.NoCacheNegroni)
+	n.UseFunc(httprouterx.AddAdminPrefixIfNotPresentNegroni)
+
+	router := NewTestRouterAdmin(t)
+	n.UseHandler(router)
+
+	ts := httptest.NewServer(n)
 	t.Cleanup(ts.Close)
 
-	router.GET("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /admin/foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.DELETE("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("DELETE /admin/foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.POST("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("POST /admin/foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.PUT("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("PUT /admin/foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.PATCH("/foo", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("PATCH /admin/foo", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	for _, method := range []string{} {
-		req, _ := http.NewRequest(method, ts.URL+"/admin/foo", nil)
-		res, err := ts.Client().Do(req)
-		require.NoError(t, err)
-		assert.EqualValues(t, http.StatusNoContent, res.StatusCode)
+	for _, method := range []string{"GET", "DELETE", "POST", "PUT", "PATCH"} {
+		{
+			req, _ := http.NewRequest(method, ts.URL+"/foo", nil)
+			res, err := ts.Client().Do(req)
+			require.NoError(t, err)
+			assert.EqualValues(t, http.StatusNoContent, res.StatusCode)
+		}
+		{
+			req, _ := http.NewRequest(method, ts.URL+"/admin/foo", nil)
+			res, err := ts.Client().Do(req)
+			require.NoError(t, err)
+			assert.EqualValues(t, http.StatusNoContent, res.StatusCode)
+		}
 	}
 }

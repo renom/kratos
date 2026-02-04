@@ -7,11 +7,12 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+
 	"github.com/ory/x/stringsx"
 
 	"github.com/ory/kratos/driver/config"
-
-	"github.com/julienschmidt/httprouter"
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/x"
@@ -33,7 +34,7 @@ type (
 	}
 	Handler struct {
 		r    handlerDependencies
-		csrf x.CSRFToken
+		csrf nosurfx.CSRFToken
 	}
 )
 
@@ -52,7 +53,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 }
 
 func (h *Handler) RegisterAdminRoutes(public *x.RouterAdmin) {
-	public.GET(RouteGet, x.RedirectToPublicRoute(h.r))
+	public.GET(RouteGet, redir.RedirectToPublicRoute(h.r))
 }
 
 // swagger:parameters getFlowError
@@ -89,7 +90,7 @@ type getFlowError struct {
 //	  403: errorGeneric
 //	  404: errorGeneric
 //	  500: errorGeneric
-func (h *Handler) publicFetchError(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) publicFetchError(w http.ResponseWriter, r *http.Request) {
 	if err := h.fetchError(w, r); err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return

@@ -10,24 +10,20 @@ import (
 	"reflect"
 	"slices"
 	"sort"
-
-	"github.com/ory/kratos/schema"
-	"github.com/ory/x/sqlcon"
-
-	"github.com/ory/x/otelx"
-
-	"github.com/ory/kratos/x"
-
-	"github.com/ory/kratos/driver/config"
+	"strings"
 
 	"github.com/gofrs/uuid"
-
 	"github.com/mohae/deepcopy"
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
 	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/x"
+	"github.com/ory/x/otelx"
+	"github.com/ory/x/sqlcon"
 )
 
 var ErrProtectedFieldModified = herodot.ErrForbidden.
@@ -102,7 +98,7 @@ func (m *Manager) Create(ctx context.Context, i *Identity, opts ...ManagerOption
 	return nil
 }
 
-func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *Identity, foundConflictAddress string, err error) {
+func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *Identity, foundConflictAddress string, conflictAddressType string, err error) {
 	for ct, cred := range i.Credentials {
 		for _, id := range cred.Identifiers {
 			found, _, err = m.r.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, ct, id)
@@ -112,10 +108,10 @@ func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *
 
 			// FindByCredentialsIdentifier does not expand identity credentials.
 			if err = m.r.PrivilegedIdentityPool().HydrateIdentityAssociations(ctx, found, ExpandCredentials); err != nil {
-				return nil, "", err
+				return nil, "", "", err
 			}
 
-			return found, id, nil
+			return found, id, ct.String(), nil
 		}
 	}
 
@@ -125,16 +121,16 @@ func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *
 		if errors.Is(err, sqlcon.ErrNoRows) {
 			continue
 		} else if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
 		foundConflictAddress = conflictingAddress.Value
 		found, err = m.r.PrivilegedIdentityPool().GetIdentity(ctx, conflictingAddress.IdentityID, ExpandCredentials)
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
-		return found, foundConflictAddress, nil
+		return found, foundConflictAddress, va.Via, nil
 	}
 
 	// Last option: check the recovery address
@@ -143,19 +139,19 @@ func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *
 		if errors.Is(err, sqlcon.ErrNoRows) {
 			continue
 		} else if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
 		foundConflictAddress = conflictingAddress.Value
 		found, err = m.r.PrivilegedIdentityPool().GetIdentity(ctx, conflictingAddress.IdentityID, ExpandCredentials)
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
-		return found, foundConflictAddress, nil
+		return found, foundConflictAddress, string(va.Via), nil
 	}
 
-	return nil, "", sqlcon.ErrNoRows
+	return nil, "", "", sqlcon.ErrNoRows
 }
 
 func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identity) (err error) {
@@ -163,7 +159,7 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 		return &ErrDuplicateCredentials{error: e}
 	}
 
-	found, foundConflictAddress, err := m.ConflictingIdentity(ctx, i)
+	found, foundConflictAddress, conflictingAddressType, err := m.ConflictingIdentity(ctx, i)
 	if err != nil {
 		if errors.Is(err, sqlcon.ErrNoRows) {
 			return &ErrDuplicateCredentials{error: e}
@@ -181,6 +177,11 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 	})
 
 	duplicateCredErr := &ErrDuplicateCredentials{error: e}
+	// OIDC credentials are not email addresses but the sub claim from the OIDC provider.
+	// This is useless for the user, so in that case, we don't set the identifier hint.
+	if conflictingAddressType != CredentialsTypeOIDC.String() {
+		duplicateCredErr.SetIdentifierHint(strings.Trim(foundConflictAddress, " "))
+	}
 
 	for _, cred := range creds {
 		if cred.Config == nil {
@@ -192,11 +193,9 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 		// in to the first factor (obviously).
 		switch cred.Type {
 		case CredentialsTypePassword:
-			identifierHint := foundConflictAddress
-			if len(cred.Identifiers) > 0 {
-				identifierHint = cred.Identifiers[0]
+			if duplicateCredErr.IdentifierHint() == "" && len(cred.Identifiers) == 1 {
+				duplicateCredErr.SetIdentifierHint(cred.Identifiers[0])
 			}
-			duplicateCredErr.SetIdentifierHint(identifierHint)
 
 			var cfg CredentialsPassword
 			if err := json.Unmarshal(cred.Config, &cfg); err != nil {
@@ -209,14 +208,7 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 			}
 
 			duplicateCredErr.AddCredentialsType(cred.Type)
-
 		case CredentialsTypeCodeAuth:
-			identifierHint := foundConflictAddress
-			if len(cred.Identifiers) > 0 {
-				identifierHint = cred.Identifiers[0]
-			}
-
-			duplicateCredErr.SetIdentifierHint(identifierHint)
 			duplicateCredErr.AddCredentialsType(cred.Type)
 		case CredentialsTypeOIDC:
 			var cfg CredentialsOIDC
@@ -230,7 +222,6 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 			}
 
 			duplicateCredErr.AddCredentialsType(cred.Type)
-			duplicateCredErr.SetIdentifierHint(foundConflictAddress)
 			duplicateCredErr.availableOIDCProviders = available
 		case CredentialsTypeWebAuthn:
 			var cfg CredentialsWebAuthnConfig
@@ -238,15 +229,12 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 				return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to JSON decode identity credentials %s for identity %s.", cred.Type, found.ID))
 			}
 
-			identifierHint := foundConflictAddress
-			if len(cred.Identifiers) > 0 {
-				identifierHint = cred.Identifiers[0]
+			if duplicateCredErr.IdentifierHint() == "" && len(cred.Identifiers) == 1 {
+				duplicateCredErr.SetIdentifierHint(cred.Identifiers[0])
 			}
-
 			for _, webauthn := range cfg.Credentials {
 				if webauthn.IsPasswordless {
 					duplicateCredErr.AddCredentialsType(cred.Type)
-					duplicateCredErr.SetIdentifierHint(identifierHint)
 					break
 				}
 			}
@@ -256,15 +244,12 @@ func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identi
 				return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to JSON decode identity credentials %s for identity %s.", cred.Type, found.ID))
 			}
 
-			identifierHint := foundConflictAddress
-			if len(cred.Identifiers) > 0 {
-				identifierHint = cred.Identifiers[0]
+			if duplicateCredErr.IdentifierHint() == "" && len(cred.Identifiers) == 1 {
+				duplicateCredErr.SetIdentifierHint(cred.Identifiers[0])
 			}
-
 			for _, webauthn := range cfg.Credentials {
 				if webauthn.IsPasswordless {
 					duplicateCredErr.AddCredentialsType(cred.Type)
-					duplicateCredErr.SetIdentifierHint(identifierHint)
 					break
 				}
 			}
@@ -333,10 +318,17 @@ type CreateIdentitiesError struct {
 	failedIdentities map[*Identity]*herodot.DefaultError
 }
 
+func NewCreateIdentitiesError(capacity int) *CreateIdentitiesError {
+	return &CreateIdentitiesError{
+		failedIdentities: make(map[*Identity]*herodot.DefaultError, capacity),
+	}
+}
+
 func (e *CreateIdentitiesError) Error() string {
 	e.init()
 	return fmt.Sprintf("create identities error: %d identities failed", len(e.failedIdentities))
 }
+
 func (e *CreateIdentitiesError) Unwrap() []error {
 	e.init()
 	var errs []error
@@ -350,17 +342,20 @@ func (e *CreateIdentitiesError) AddFailedIdentity(ident *Identity, err *herodot.
 	e.init()
 	e.failedIdentities[ident] = err
 }
+
 func (e *CreateIdentitiesError) Merge(other *CreateIdentitiesError) {
 	e.init()
 	for k, v := range other.failedIdentities {
 		e.failedIdentities[k] = v
 	}
 }
+
 func (e *CreateIdentitiesError) Contains(ident *Identity) bool {
 	e.init()
 	_, found := e.failedIdentities[ident]
 	return found
 }
+
 func (e *CreateIdentitiesError) Find(ident *Identity) *FailedIdentity {
 	e.init()
 	if err, found := e.failedIdentities[ident]; found {
@@ -369,12 +364,14 @@ func (e *CreateIdentitiesError) Find(ident *Identity) *FailedIdentity {
 
 	return nil
 }
+
 func (e *CreateIdentitiesError) ErrOrNil() error {
-	if e.failedIdentities == nil || len(e.failedIdentities) == 0 {
+	if e == nil || len(e.failedIdentities) == 0 {
 		return nil
 	}
 	return e
 }
+
 func (e *CreateIdentitiesError) init() {
 	if e.failedIdentities == nil {
 		e.failedIdentities = map[*Identity]*herodot.DefaultError{}
@@ -385,7 +382,7 @@ func (m *Manager) CreateIdentities(ctx context.Context, identities []*Identity, 
 	ctx, span := m.r.Tracer(ctx).Tracer().Start(ctx, "identity.Manager.CreateIdentities")
 	defer otelx.End(span, &err)
 
-	createIdentitiesError := &CreateIdentitiesError{}
+	createIdentitiesError := NewCreateIdentitiesError(len(identities))
 	validIdentities := make([]*Identity, 0, len(identities))
 	for _, ident := range identities {
 		if ident.SchemaID == "" {
@@ -452,7 +449,7 @@ func (m *Manager) Update(ctx context.Context, updated *Identity, opts ...Manager
 		return err
 	}
 
-	return m.r.PrivilegedIdentityPool().UpdateIdentity(ctx, updated)
+	return m.r.PrivilegedIdentityPool().UpdateIdentity(ctx, updated, DiffAgainst(original))
 }
 
 func (m *Manager) UpdateSchemaID(ctx context.Context, id uuid.UUID, schemaID string, opts ...ManagerOption) (err error) {

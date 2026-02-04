@@ -10,10 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/selfservice/strategy/idfirst"
-
-	configtesthelpers "github.com/ory/kratos/driver/config/testhelpers"
-
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/require"
 
@@ -24,7 +20,9 @@ import (
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
+	"github.com/ory/kratos/selfservice/strategy/idfirst"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/snapshotx"
 )
 
@@ -44,8 +42,8 @@ func TestFormHydration(t *testing.T) {
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 	providerID := "test-provider"
 
-	ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeOIDC)+".enabled", true)
-	ctx = configtesthelpers.WithConfigValue(
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeOIDC)+".enabled", true)
+	ctx = contextx.WithConfigValue(
 		ctx,
 		config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeOIDC)+".config",
 		map[string]interface{}{
@@ -103,41 +101,44 @@ func TestFormHydration(t *testing.T) {
 		r.Header = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 		f.Refresh = true
 
-		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 		toSnapshot(t, f)
 	})
 
 	t.Run("method=PopulateLoginMethodSecondFactorRefresh", func(t *testing.T) {
 		r, f := newFlow(ctx, t)
-		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 		toSnapshot(t, f)
 	})
 
 	t.Run("method=PopulateLoginMethodIdentifierFirstCredentials", func(t *testing.T) {
 		t.Run("case=no options", func(t *testing.T) {
 			r, f := newFlow(ctx, t)
+			require.NoError(t, fh.PopulateLoginMethodFirstFactor(r, f))
 			require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f), idfirst.ErrNoCredentialsFound)
 			toSnapshot(t, f)
 		})
 
 		t.Run("case=WithIdentifier", func(t *testing.T) {
 			r, f := newFlow(ctx, t)
+			require.NoError(t, fh.PopulateLoginMethodFirstFactor(r, f))
 			require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentifier("foo@bar.com")), idfirst.ErrNoCredentialsFound)
 			toSnapshot(t, f)
 		})
 
 		t.Run("case=WithIdentityHint", func(t *testing.T) {
 			t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
-				ctx := configtesthelpers.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, true)
+				ctx := contextx.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, true)
 
 				id := identity.NewIdentity(providerID)
 				r, f := newFlow(ctx, t)
+				require.NoError(t, fh.PopulateLoginMethodFirstFactor(r, f))
 				require.NoError(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentityHint(id)))
 				toSnapshot(t, f)
 			})
 
 			t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
-				ctx := configtesthelpers.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, false)
+				ctx := contextx.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, false)
 
 				t.Run("case=identity has oidc", func(t *testing.T) {
 					identifier := x.NewUUID()

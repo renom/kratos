@@ -13,25 +13,24 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ory/kratos/selfservice/flow"
-
-	"github.com/ory/kratos/internal/settingshelpers"
-	"github.com/ory/kratos/text"
-
-	kratos "github.com/ory/kratos/internal/httpclient"
-
-	"github.com/ory/kratos/corpx"
-
+	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/client-go"
+	"github.com/ory/kratos/corpx"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	kratos "github.com/ory/kratos/internal/httpclient"
+	"github.com/ory/kratos/internal/settingshelpers"
 	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/settings"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/assertx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/ioutilx"
@@ -104,12 +103,177 @@ func TestSettings(t *testing.T) {
 	apiUser1 := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, apiIdentity1)
 	apiUser2 := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, apiIdentity2)
 
+	t.Run("case=should reject a new password if it is the same as the old one", func(t *testing.T) {
+		conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypePassword.String()), []config.SelfServiceHook{{Name: "session"}})
+		t.Cleanup(func() {
+			conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypePassword.String()), nil)
+		})
+
+		cfg := client.NewConfiguration()
+		u, err := url.Parse(publicTS.URL)
+		require.NoError(t, err)
+		cfg.Scheme = u.Scheme
+		cfg.Host = u.Host
+		cl := client.NewAPIClient(cfg)
+		api := cl.FrontendAPI
+
+		t.Run("type=api", func(t *testing.T) {
+			// Create a new account.
+			password := uuid.Must(uuid.NewV4()).String()
+			var sessionToken string
+			{
+				registrationFlow, _, err := api.CreateNativeRegistrationFlow(t.Context()).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, registrationFlow)
+
+				registrationBody := client.UpdateRegistrationFlowBody{
+					UpdateRegistrationFlowWithPasswordMethod: &client.UpdateRegistrationFlowWithPasswordMethod{
+						Method:   "password",
+						Password: password,
+						Traits: map[string]any{
+							"email": uuid.Must(uuid.NewV4()).String() + "@ory.dev",
+						},
+					},
+				}
+				registration, _, err := api.UpdateRegistrationFlow(t.Context()).Flow(registrationFlow.Id).UpdateRegistrationFlowBody(registrationBody).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, registration)
+				require.NotNil(t, registration.SessionToken)
+
+				sessionToken = *registration.SessionToken
+				require.NotEmpty(t, sessionToken)
+			}
+
+			// Create a settings flow.
+			var settingsFlow *client.SettingsFlow
+			{
+
+				var err error
+				settingsFlow, _, err = api.CreateNativeSettingsFlow(t.Context()).XSessionToken(sessionToken).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, settingsFlow)
+			}
+
+			// Try to set the same password: fails.
+			{
+				update := client.UpdateSettingsFlowBody{
+					UpdateSettingsFlowWithPasswordMethod: &client.UpdateSettingsFlowWithPasswordMethod{
+						Method:   "password",
+						Password: password,
+					},
+				}
+				req := api.UpdateSettingsFlow(t.Context()).UpdateSettingsFlowBody(update).Flow(settingsFlow.Id).XSessionToken(sessionToken)
+				settingsFlow, httpResp, err := api.UpdateSettingsFlowExecute(req)
+				require.Error(t, err)
+				require.Nil(t, settingsFlow)
+				require.NotNil(t, httpResp)
+				require.Equal(t, http.StatusBadRequest, httpResp.StatusCode)
+			}
+
+			// Try to set a different password: succeeds.
+			{
+				update := client.UpdateSettingsFlowBody{
+					UpdateSettingsFlowWithPasswordMethod: &client.UpdateSettingsFlowWithPasswordMethod{
+						Method:   "password",
+						Password: uuid.Must(uuid.NewV4()).String(),
+					},
+				}
+				req := api.UpdateSettingsFlow(t.Context()).UpdateSettingsFlowBody(update).Flow(settingsFlow.Id).XSessionToken(sessionToken)
+				settingsFlow, httpResp, err := api.UpdateSettingsFlowExecute(req)
+				require.NoError(t, err)
+				require.NotNil(t, settingsFlow)
+				require.NotNil(t, httpResp)
+				require.Equal(t, http.StatusOK, httpResp.StatusCode)
+			}
+		})
+
+		t.Run("type=browser", func(t *testing.T) {
+			// Create a new account.
+			password := uuid.Must(uuid.NewV4()).String()
+			var cookie string
+			{
+				registrationFlow, _, err := api.CreateBrowserRegistrationFlow(t.Context()).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, registrationFlow)
+
+				csrfToken := registrationFlow.Ui.Nodes[0].Attributes.UiNodeInputAttributes.Value.(string)
+				require.NotEmpty(t, csrfToken)
+
+				registrationBody := client.UpdateRegistrationFlowBody{
+					UpdateRegistrationFlowWithPasswordMethod: &client.UpdateRegistrationFlowWithPasswordMethod{
+						Method:   "password",
+						Password: password,
+						Traits: map[string]any{
+							"email": uuid.Must(uuid.NewV4()).String() + "@ory.dev",
+						},
+						CsrfToken: &csrfToken,
+					},
+				}
+
+				registration, httpResp, err := api.UpdateRegistrationFlow(t.Context()).Flow(registrationFlow.Id).UpdateRegistrationFlowBody(registrationBody).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, httpResp)
+				require.NotNil(t, registration)
+				cookie = httpResp.Header.Get("Set-Cookie")
+				require.NotEmpty(t, cookie)
+			}
+
+			// Create a settings flow.
+			var settingsFlow *client.SettingsFlow
+			var csrfToken string
+			{
+
+				var err error
+				settingsFlow, _, err = api.CreateBrowserSettingsFlow(t.Context()).Cookie(cookie).Execute()
+				require.NoError(t, err)
+				require.NotNil(t, settingsFlow)
+
+				csrfToken = settingsFlow.Ui.Nodes[0].Attributes.UiNodeInputAttributes.Value.(string)
+				require.NotEmpty(t, csrfToken)
+			}
+
+			// Try to set the same password: fails.
+			{
+				update := client.UpdateSettingsFlowBody{
+					UpdateSettingsFlowWithPasswordMethod: &client.UpdateSettingsFlowWithPasswordMethod{
+						Method:    "password",
+						Password:  password,
+						CsrfToken: &csrfToken,
+					},
+				}
+				req := api.UpdateSettingsFlow(t.Context()).UpdateSettingsFlowBody(update).Flow(settingsFlow.Id).Cookie(cookie)
+				settingsFlow, httpResp, err := api.UpdateSettingsFlowExecute(req)
+				require.Error(t, err)
+				require.Nil(t, settingsFlow)
+				require.NotNil(t, httpResp)
+				require.Equal(t, http.StatusBadRequest, httpResp.StatusCode)
+			}
+
+			// Try to set a different password: succeeds.
+			{
+				update := client.UpdateSettingsFlowBody{
+					UpdateSettingsFlowWithPasswordMethod: &client.UpdateSettingsFlowWithPasswordMethod{
+						Method:    "password",
+						Password:  uuid.Must(uuid.NewV4()).String(),
+						CsrfToken: &csrfToken,
+					},
+				}
+				req := api.UpdateSettingsFlow(t.Context()).UpdateSettingsFlowBody(update).Flow(settingsFlow.Id).Cookie(cookie)
+				settingsFlow, httpResp, err := api.UpdateSettingsFlowExecute(req)
+				require.NoError(t, err)
+				require.NotNil(t, settingsFlow)
+				require.NotNil(t, httpResp)
+				require.Equal(t, http.StatusOK, httpResp.StatusCode)
+			}
+		})
+	})
+
 	t.Run("description=not authorized to call endpoints without a session", func(t *testing.T) {
 		c := testhelpers.NewDebugClient(t)
 		t.Run("type=browser", func(t *testing.T) {
 			res, err := c.Do(httpx.MustNewRequest("POST", publicTS.URL+settings.RouteSubmitFlow, strings.NewReader(url.Values{"foo": {"bar"}}.Encode()), "application/x-www-form-urlencoded"))
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode, "%+v", res.Request)
 			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceLoginUI))
 		})
@@ -117,7 +281,7 @@ func TestSettings(t *testing.T) {
 		t.Run("type=spa", func(t *testing.T) {
 			res, err := c.Do(httpx.MustNewRequest("POST", publicTS.URL+settings.RouteSubmitFlow, strings.NewReader(url.Values{"foo": {"bar"}}.Encode()), "application/json"))
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode, "%+v", res.Request)
 			assert.Contains(t, res.Request.URL.String(), settings.RouteSubmitFlow)
 		})
@@ -126,19 +290,19 @@ func TestSettings(t *testing.T) {
 			res, err := c.Do(httpx.MustNewRequest("POST", publicTS.URL+settings.RouteSubmitFlow, strings.NewReader(`{"foo":"bar"}`), "application/json"))
 			require.NoError(t, err)
 			assert.Len(t, res.Cookies(), 0)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode)
 		})
 	})
 
-	var expectValidationError = func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
+	expectValidationError := func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
 		return testhelpers.SubmitSettingsForm(t, isAPI, isSPA, hc, publicTS, values,
 			testhelpers.ExpectStatusCode(isAPI || isSPA, http.StatusBadRequest, http.StatusOK),
 			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI(ctx).String()))
 	}
 
 	t.Run("description=should fail if password violates policy", func(t *testing.T) {
-		var check = func(t *testing.T, reason, actual string) {
+		check := func(t *testing.T, reason, actual string) {
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==password).attributes.value").String(), "%s", actual)
 			assert.NotEmpty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==csrf_token).attributes.value").String(), "%s", actual)
 			assert.Equal(t, reason, gjson.Get(actual, "ui.nodes.#(attributes.name==password).messages.0.text").String(), "%s", actual)
@@ -147,7 +311,7 @@ func TestSettings(t *testing.T) {
 		t.Run("session=with privileged session", func(t *testing.T) {
 			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
 
-			var payload = func(v url.Values) {
+			payload := func(v url.Values) {
 				v.Set("password", "123456")
 				v.Set("method", "password")
 			}
@@ -172,7 +336,7 @@ func TestSettings(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
 			})
 
-			var payload = func(v url.Values) {
+			payload := func(v url.Values) {
 				v.Set("method", "password")
 				v.Set("password", "123456")
 			}
@@ -233,13 +397,13 @@ func TestSettings(t *testing.T) {
 	})
 
 	t.Run("description=should update the password and clear errors if everything is ok", func(t *testing.T) {
-		var check = func(t *testing.T, actual string) {
+		check := func(t *testing.T, actual string) {
 			assert.Equal(t, "success", gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==password).value").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==password).messages.0.text").String(), actual)
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", "password")
 			v.Set("password", x.NewUUID().String())
 		}
@@ -275,7 +439,7 @@ func TestSettings(t *testing.T) {
 		assert.Equal(t, http.StatusOK, res.StatusCode)
 		assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceErrorUI))
 
-		assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken, json.RawMessage(actual), "%s", actual)
+		assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken, json.RawMessage(actual), "%s", actual)
 	})
 
 	t.Run("case=should pass even without CSRF token/type=spa", func(t *testing.T) {
@@ -288,7 +452,7 @@ func TestSettings(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, res.StatusCode)
 
 		assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-		assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken, json.RawMessage(gjson.Get(actual, "error").Raw), "%s", actual)
+		assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken, json.RawMessage(gjson.Get(actual, "error").Raw), "%s", actual)
 	})
 
 	t.Run("case=should pass even without CSRF token/type=api", func(t *testing.T) {
@@ -332,7 +496,7 @@ func TestSettings(t *testing.T) {
 
 				res, err := apiUser1.Do(req)
 				require.NoError(t, err)
-				defer res.Body.Close()
+				defer func() { _ = res.Body.Close() }()
 
 				actual := string(ioutilx.MustReadAll(res.Body))
 				assert.EqualValues(t, http.StatusBadRequest, res.StatusCode)
@@ -341,7 +505,7 @@ func TestSettings(t *testing.T) {
 		}
 	})
 
-	var expectSuccess = func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
+	expectSuccess := func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
 		return testhelpers.SubmitSettingsForm(t, isAPI, isSPA, hc, publicTS, values, http.StatusOK,
 			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI(ctx).String()))
 	}
@@ -354,7 +518,7 @@ func TestSettings(t *testing.T) {
 		spaUser := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, ctx, reg, si)
 		apiUser := testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, ai)
 
-		var check = func(t *testing.T, actual string, id *identity.Identity) {
+		check := func(t *testing.T, actual string, id *identity.Identity) {
 			assert.Equal(t, "success", gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(name==password).attributes.value").String(), "%s", actual)
 
@@ -366,7 +530,7 @@ func TestSettings(t *testing.T) {
 			assert.Contains(t, actualIdentity.Credentials[identity.CredentialsTypePassword].Identifiers[0], "-4")
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", "password")
 			v.Set("password", randx.MustString(16, randx.AlphaNum))
 		}
@@ -394,7 +558,7 @@ func TestSettings(t *testing.T) {
 			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsAfter, nil)
 		})
 
-		var run = func(t *testing.T, f *kratos.SettingsFlow, isAPI bool, c *http.Client, _ *identity.Identity) {
+		run := func(t *testing.T, f *kratos.SettingsFlow, isAPI bool, c *http.Client, _ *identity.Identity) {
 			values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 			values.Set("method", "password")
 			values.Set("password", randx.MustString(16, randx.AlphaNum))
@@ -429,7 +593,7 @@ func TestSettings(t *testing.T) {
 			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsAfter, nil)
 		})
 
-		var check = func(t *testing.T, actual string, id *identity.Identity) {
+		check := func(t *testing.T, actual string, id *identity.Identity) {
 			assert.Equal(t, "success", gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(name==password).attributes.value").String(), "%s", actual)
 
@@ -441,7 +605,7 @@ func TestSettings(t *testing.T) {
 			assert.Contains(t, actualIdentity.Credentials[identity.CredentialsTypePassword].Identifiers[0], "-4")
 		}
 
-		var initClients = func(isAPI, isSPA bool, id *identity.Identity) (client1, client2 *http.Client) {
+		initClients := func(isAPI bool, id *identity.Identity) (client1, client2 *http.Client) {
 			if isAPI {
 				client1 = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
 				client2 = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id)
@@ -453,13 +617,13 @@ func TestSettings(t *testing.T) {
 			return client1, client2
 		}
 
-		var run = func(t *testing.T, isAPI, isSPA bool, id *identity.Identity) {
-			var payload = func(v url.Values) {
+		run := func(t *testing.T, isAPI, isSPA bool, id *identity.Identity) {
+			payload := func(v url.Values) {
 				v.Set("method", "password")
 				v.Set("password", randx.MustString(16, randx.AlphaNum))
 			}
 
-			user1, user2 := initClients(isAPI, isSPA, id)
+			user1, user2 := initClients(isAPI, id)
 
 			actual := expectSuccess(t, isAPI, isSPA, user1, payload)
 			check(t, actual, id)
@@ -467,7 +631,7 @@ func TestSettings(t *testing.T) {
 			// second client should be logged out
 			res, err := user2.Do(httpx.MustNewRequest("POST", publicTS.URL+settings.RouteSubmitFlow, strings.NewReader(url.Values{"foo": {"bar"}}.Encode()), "application/json"))
 			require.NoError(t, err)
-			res.Body.Close()
+			require.NoError(t, res.Body.Close())
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode, "%+v", res.Request)
 
 			// again change password via first client

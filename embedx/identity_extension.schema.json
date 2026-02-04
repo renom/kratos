@@ -79,7 +79,17 @@
               "properties": {
                 "via": {
                   "type": "string",
-                  "enum": ["email"]
+                  "enum": ["email", "sms"]
+                }
+              }
+            },
+            "organizations": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "matcher": {
+                  "type": "string",
+                  "enum": ["email_domain"]
                 }
               }
             }

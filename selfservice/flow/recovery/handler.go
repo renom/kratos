@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+
 	"github.com/ory/nosurf"
 
 	"github.com/ory/kratos/schema"
@@ -17,7 +20,6 @@ import (
 
 	"github.com/ory/herodot"
 
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 
 	"github.com/ory/x/urlx"
@@ -49,9 +51,9 @@ type (
 		session.HandlerProvider
 		StrategyProvider
 		FlowPersistenceProvider
-		x.CSRFTokenGeneratorProvider
+		nosurfx.CSRFTokenGeneratorProvider
 		x.WriterProvider
-		x.CSRFProvider
+		nosurfx.CSRFProvider
 		config.Provider
 		ErrorHandlerProvider
 		HookExecutorProvider
@@ -70,11 +72,11 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
 
 	redirect := session.RedirectOnAuthenticated(h.d)
-	public.GET(RouteInitBrowserFlow, h.d.SessionHandler().IsNotAuthenticated(h.createBrowserRecoveryFlow, func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	public.GET(RouteInitBrowserFlow, h.d.SessionHandler().IsNotAuthenticated(h.createBrowserRecoveryFlow, func(w http.ResponseWriter, r *http.Request) {
 		if x.IsJSONRequest(r) {
 			h.d.Writer().WriteError(w, r, errors.WithStack(ErrAlreadyLoggedIn))
 		} else {
-			redirect(w, r, ps)
+			redirect(w, r)
 		}
 	}))
 
@@ -88,11 +90,11 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
-	admin.GET(RouteInitBrowserFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteInitAPIFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteGetFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
-	admin.POST(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
+	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
+	admin.POST(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
 }
 
 // swagger:route GET /self-service/recovery/api frontend createNativeRecoveryFlow
@@ -119,7 +121,7 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 //	  200: recoveryFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) createNativeRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
@@ -184,7 +186,7 @@ type createBrowserRecoveryFlow struct {
 //	  303: emptyResponse
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createBrowserRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) createBrowserRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
@@ -212,7 +214,7 @@ func (h *Handler) createBrowserRecoveryFlow(w http.ResponseWriter, r *http.Reque
 	}
 
 	redirTo := f.AppendTo(h.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String()
-	x.AcceptToRedirectOrJSON(w, r, h.d.Writer(), f, redirTo)
+	x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), f, redirTo)
 }
 
 // Get Recovery Flow Parameters
@@ -274,7 +276,7 @@ type getRecoveryFlow struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRecoveryEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrBadRequest.WithReasonf("Recovery is not allowed because it was disabled.")))
 		return
@@ -291,7 +293,7 @@ func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request, _ http
 	//
 	// Resolves: https://github.com/ory/kratos/issues/1282
 	if f.Type.IsBrowser() && !f.DangerousSkipCSRFCheck && !nosurf.VerifyToken(h.d.GenerateCSRFToken(r), f.CSRFToken) {
-		h.d.Writer().WriteError(w, r, x.CSRFErrorReason(r, h.d))
+		h.d.Writer().WriteError(w, r, nosurfx.CSRFErrorReason(r, h.d))
 		return
 	}
 
@@ -299,7 +301,7 @@ func (h *Handler) getRecoveryFlow(w http.ResponseWriter, r *http.Request, _ http
 		if f.Type == flow.TypeBrowser {
 			redirectURL := flow.GetFlowExpiredRedirectURL(r.Context(), h.d.Config(), RouteInitBrowserFlow, f.ReturnTo)
 
-			h.d.Writer().WriteError(w, r, errors.WithStack(x.ErrGone.
+			h.d.Writer().WriteError(w, r, errors.WithStack(nosurfx.ErrGone.
 				WithReason("The recovery flow has expired. Redirect the user to the recovery flow init endpoint to initialize a new recovery flow.").
 				WithDetail("redirect_to", redirectURL.String()).
 				WithDetail("return_to", f.ReturnTo)))
@@ -399,7 +401,7 @@ type updateRecoveryFlowBody struct{}
 //	      410: errorGeneric
 //	      422: errorBrowserLocationChangeRequired
 //	      default: errorGeneric
-func (h *Handler) updateRecoveryFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) updateRecoveryFlow(w http.ResponseWriter, r *http.Request) {
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
 		h.d.RecoveryFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)

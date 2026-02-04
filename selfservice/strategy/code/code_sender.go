@@ -10,13 +10,11 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
+	"github.com/ory/x/urlx"
+
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/courier/template/email"
 	"github.com/ory/kratos/courier/template/sms"
-
-	"github.com/ory/x/sqlcon"
-	"github.com/ory/x/stringsx"
-	"github.com/ory/x/urlx"
 
 	"github.com/ory/kratos/courier"
 	"github.com/ory/kratos/driver/config"
@@ -25,6 +23,8 @@ import (
 	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/stringsx"
 )
 
 type (
@@ -197,18 +197,18 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 // If the address does not exist in the store and dispatching invalid emails is enabled (CourierEnableInvalidDispatch is
 // true), an email is still being sent to prevent account enumeration attacks. In that case, this function returns the
 // ErrUnknownAddress error.
-func (s *Sender) SendRecoveryCode(ctx context.Context, f *recovery.Flow, via identity.VerifiableAddressType, to string) error {
+func (s *Sender) SendRecoveryCode(ctx context.Context, f *recovery.Flow, via identity.RecoveryAddressType, to string) error {
 	s.deps.Logger().
 		WithField("via", via).
 		WithSensitiveField("address", to).
 		Debug("Preparing recovery code.")
 
-	address, err := s.deps.IdentityPool().FindRecoveryAddressByValue(ctx, identity.RecoveryAddressTypeEmail, to)
+	address, err := s.deps.IdentityPool().FindRecoveryAddressByValue(ctx, via, to)
 	if errors.Is(err, sqlcon.ErrNoRows) {
 		notifyUnknownRecipients := s.deps.Config().SelfServiceFlowRecoveryNotifyUnknownRecipients(ctx)
 		s.deps.Audit().
 			WithField("via", via).
-			WithSensitiveField("email_address", address).
+			WithSensitiveField("address", address).
 			WithField("strategy", "code").
 			WithField("was_notified", notifyUnknownRecipients).
 			Info("Account recovery was requested for an unknown address.")
@@ -217,7 +217,12 @@ func (s *Sender) SendRecoveryCode(ctx context.Context, f *recovery.Flow, via ide
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		if !notifyUnknownRecipients {
+
+		// We only send a notification if the configuration allows it *and* the channel is email.
+		// That's because we pay per SMS sent (typically) so we want to avoid that, contrary to email.
+		shouldNotifyOfUnkownRecipient := notifyUnknownRecipients && via == identity.RecoveryAddressTypeEmail
+
+		if !shouldNotifyOfUnkownRecipient {
 			// do nothing
 		} else if err := s.send(ctx, string(via), email.NewRecoveryCodeInvalid(s.deps, &email.RecoveryCodeInvalidModel{
 			To:               to,
@@ -262,9 +267,9 @@ func (s *Sender) SendRecoveryCodeTo(ctx context.Context, i *identity.Identity, c
 		WithField("via", code.RecoveryAddress.Via).
 		WithField("identity_id", code.RecoveryAddress.IdentityID).
 		WithField("recovery_code_id", code.ID).
-		WithSensitiveField("email_address", code.RecoveryAddress.Value).
+		WithSensitiveField("address", code.RecoveryAddress.Value).
 		WithSensitiveField("recovery_code", codeString).
-		Info("Sending out recovery email with recovery code.")
+		Info("Sending out recovery code.")
 
 	model, err := x.StructToMap(i)
 	if err != nil {
@@ -276,16 +281,38 @@ func (s *Sender) SendRecoveryCodeTo(ctx context.Context, i *identity.Identity, c
 		return errors.WithStack(err)
 	}
 
-	emailModel := email.RecoveryCodeValidModel{
-		To:               code.RecoveryAddress.Value,
-		RecoveryCode:     codeString,
-		Identity:         model,
-		RequestURL:       f.GetRequestURL(),
-		TransientPayload: transientPayload,
-		ExpiresInMinutes: int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+	var t courier.Template
+
+	switch code.RecoveryAddress.Via {
+	case identity.RecoveryAddressTypeEmail:
+		t = email.NewRecoveryCodeValid(s.deps, &email.RecoveryCodeValidModel{
+			To:               code.RecoveryAddress.Value,
+			RecoveryCode:     codeString,
+			Identity:         model,
+			RequestURL:       f.GetRequestURL(),
+			TransientPayload: transientPayload,
+			ExpiresInMinutes: int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+		})
+	case identity.RecoveryAddressTypeSMS:
+		u, err := url.Parse(f.GetRequestURL())
+		if err != nil {
+			return err
+		}
+
+		t = sms.NewRecoveryCodeValid(s.deps, &sms.RecoveryCodeValidModel{
+			To:               code.RecoveryAddress.Value,
+			RecoveryCode:     codeString,
+			Identity:         model,
+			RequestURL:       f.GetRequestURL(),
+			RequestURLDomain: u.Hostname(),
+			TransientPayload: transientPayload,
+			ExpiresInMinutes: int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+		})
+	default:
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Expected email or sms but got %s", code.RecoveryAddress.Via))
 	}
 
-	return s.send(ctx, string(code.RecoveryAddress.Via), email.NewRecoveryCodeValid(s.deps, &emailModel))
+	return s.send(ctx, string(code.RecoveryAddress.Via), t)
 }
 
 // SendVerificationCode sends a verification code & link to the specified address
@@ -315,7 +342,7 @@ func (s *Sender) SendVerificationCode(ctx context.Context, f *verification.Flow,
 		}
 		if !notifyUnknownRecipients {
 			// do nothing
-		} else if err := s.send(ctx, string(via), email.NewVerificationCodeInvalid(s.deps, &email.VerificationCodeInvalidModel{
+		} else if err := s.send(ctx, via, email.NewVerificationCodeInvalid(s.deps, &email.VerificationCodeInvalidModel{
 			To:               to,
 			RequestURL:       f.GetRequestURL(),
 			TransientPayload: transientPayload,
@@ -403,11 +430,11 @@ func (s *Sender) SendVerificationCodeTo(ctx context.Context, f *verification.Flo
 		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Expected email or sms but got %s", code.VerifiableAddress.Via))
 	}
 
-	if err := s.send(ctx, string(code.VerifiableAddress.Via), t); err != nil {
+	if err := s.send(ctx, code.VerifiableAddress.Via, t); err != nil {
 		return err
 	}
 	code.VerifiableAddress.Status = identity.VerifiableAddressStatusSent
-	return s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, code.VerifiableAddress)
+	return s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, code.VerifiableAddress, "status")
 }
 
 func (s *Sender) send(ctx context.Context, via string, t courier.Template) error {

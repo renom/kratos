@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/urfave/negroni"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -14,19 +15,18 @@ import (
 
 	"github.com/ory/graceful"
 	"github.com/ory/kratos/driver"
-	"github.com/ory/kratos/x"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/prometheusx"
 	"github.com/ory/x/reqlog"
-	"github.com/ory/x/servicelocatorx"
 )
 
-func NewWatchCmd(slOpts []servicelocatorx.Option, dOpts []driver.RegistryOption) *cobra.Command {
+func NewWatchCmd(dOpts []driver.RegistryOption) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "watch",
 		Short: "Starts the Ory Kratos message courier",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := driver.New(cmd.Context(), cmd.ErrOrStderr(), servicelocatorx.NewOptions(slOpts...), dOpts, []configx.OptionModifier{configx.WithFlags(cmd.Flags())})
+			r, err := driver.New(cmd.Context(), cmd.ErrOrStderr(), append(dOpts, driver.WithConfigOptions(configx.WithFlags(cmd.Flags())))...)
 			if err != nil {
 				return err
 			}
@@ -41,9 +41,9 @@ func NewWatchCmd(slOpts []servicelocatorx.Option, dOpts []driver.RegistryOption)
 func StartCourier(ctx context.Context, r driver.Registry) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	if r.Config().CourierExposeMetricsPort(ctx) != 0 {
+	if port := r.Config().CourierExposeMetricsPort(ctx); port != 0 {
 		eg.Go(func() error {
-			return ServeMetrics(ctx, r)
+			return ServeMetrics(ctx, r, port)
 		})
 	}
 
@@ -54,16 +54,15 @@ func StartCourier(ctx context.Context, r driver.Registry) error {
 	return eg.Wait()
 }
 
-func ServeMetrics(ctx context.Context, r driver.Registry) error {
-	c := r.Config()
+func ServeMetrics(ctx context.Context, r driver.Registry, port int) error {
+	cfg := r.Config().ServeAdmin(ctx)
 	l := r.Logger()
 	n := negroni.New()
 
-	router := x.NewRouterAdmin()
+	router := http.NewServeMux()
 
-	r.MetricsHandler().SetRoutes(router.Router)
-	n.Use(reqlog.NewMiddlewareFromLogger(l, "admin#"+c.SelfPublicURL(ctx).String()))
-	n.Use(r.PrometheusManager())
+	router.Handle(prometheusx.MetricsPrometheusPath, promhttp.Handler())
+	n.Use(reqlog.NewMiddlewareFromLogger(l, "admin#"+cfg.BaseURL.String()))
 
 	n.UseHandler(router)
 
@@ -75,7 +74,7 @@ func ServeMetrics(ctx context.Context, r driver.Registry) error {
 
 	//#nosec G112 -- the correct settings are set by graceful.WithDefaults
 	server := graceful.WithDefaults(&http.Server{
-		Addr:    c.MetricsListenOn(ctx),
+		Addr:    configx.GetAddress(cfg.Host, port),
 		Handler: handler,
 	})
 

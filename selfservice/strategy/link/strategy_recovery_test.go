@@ -11,10 +11,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gofrs/uuid"
@@ -37,7 +36,9 @@ import (
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/ioutilx"
 	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlxx"
@@ -374,8 +375,7 @@ func TestRecovery(t *testing.T) {
 
 			authClient := testhelpers.NewHTTPClientWithArbitrarySessionToken(t, ctx, reg)
 			if isAPI {
-				req := httptest.NewRequest("GET", "/sessions/whoami", nil)
-				req.WithContext(confighelpers.WithConfigValue(ctx, config.ViperKeySessionLifespan, time.Hour))
+				req := httptest.NewRequest("GET", "/sessions/whoami", nil).WithContext(contextx.WithConfigValue(ctx, config.ViperKeySessionLifespan, time.Hour))
 				s, err := testhelpers.NewActiveSession(req, reg,
 					&identity.Identity{ID: x.NewUUID(), State: identity.StateActive, NID: x.NewUUID()},
 					time.Now(),
@@ -406,10 +406,10 @@ func TestRecovery(t *testing.T) {
 	})
 
 	t.Run("description=should try to recover an email that does not exist", func(t *testing.T) {
-		conf.Set(ctx, config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients, true)
+		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients, true)
 
 		t.Cleanup(func() {
-			conf.Set(ctx, config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients, false)
+			conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients, false)
 		})
 		var email string
 		check := func(t *testing.T, actual string) {
@@ -541,16 +541,27 @@ func TestRecovery(t *testing.T) {
 		}
 
 		t.Run("type=browser", func(t *testing.T) {
+			var wg sync.WaitGroup
+			wg.Add(1)
+			testhelpers.NewRecoveryAfterHookWebHookTarget(ctx, t, conf, func(t *testing.T, msg []byte) {
+				defer wg.Done()
+				assert.EqualValues(t, "recoverme1@ory.sh", gjson.GetBytes(msg, "identity.verifiable_addresses.0.value").String(), string(msg))
+				assert.EqualValues(t, true, gjson.GetBytes(msg, "identity.verifiable_addresses.0.verified").Bool(), string(msg))
+				assert.EqualValues(t, "completed", gjson.GetBytes(msg, "identity.verifiable_addresses.0.status").String(), string(msg))
+			})
+
 			email := "recoverme1@ory.sh"
 			createIdentityToRecover(t, reg, email)
 			check(t, expectSuccess(t, nil, false, false, func(v url.Values) {
 				v.Set("email", email)
 			}), email, "")
+
+			wg.Wait()
 		})
 
 		t.Run("description=should return browser to return url", func(t *testing.T) {
 			returnTo := public.URL + "/return-to"
-			conf.Set(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
+			conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
 			for _, tc := range []struct {
 				desc     string
 				returnTo string
@@ -567,9 +578,9 @@ func TestRecovery(t *testing.T) {
 					desc:     "should use return_to from config",
 					returnTo: returnTo,
 					f: func(t *testing.T, client *http.Client) *kratos.RecoveryFlow {
-						conf.Set(ctx, config.ViperKeySelfServiceRecoveryBrowserDefaultReturnTo, returnTo)
+						conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryBrowserDefaultReturnTo, returnTo)
 						t.Cleanup(func() {
-							conf.Set(ctx, config.ViperKeySelfServiceRecoveryBrowserDefaultReturnTo, "")
+							conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryBrowserDefaultReturnTo, "")
 						})
 						return testhelpers.InitializeRecoveryFlowViaBrowser(t, client, false, public, nil)
 					},
@@ -637,7 +648,7 @@ func TestRecovery(t *testing.T) {
 			assert.Equal(t, http.StatusSeeOther, res.StatusCode)
 			require.Len(t, cl.Jar.Cookies(urlx.ParseOrPanic(public.URL)), 2)
 			cookies := spew.Sdump(cl.Jar.Cookies(urlx.ParseOrPanic(public.URL)))
-			assert.Contains(t, cookies, x.CSRFTokenName)
+			assert.Contains(t, cookies, nosurfx.CSRFTokenName)
 			assert.Contains(t, cookies, "ory_kratos_session")
 			returnTo, err := res.Location()
 			require.NoError(t, err)
@@ -668,7 +679,7 @@ func TestRecovery(t *testing.T) {
 			}
 
 			check(t, expectSuccess(t, nil, false, false, values), email, testhelpers.NewClientWithCookies(t), func(cl *http.Client, req *http.Request) (*http.Response, error) {
-				_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, publicRouter.Router, req, cl)
+				_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, publicRouter, req, cl)
 				return res, nil
 			})
 		})
@@ -680,7 +691,7 @@ func TestRecovery(t *testing.T) {
 
 			cl := testhelpers.NewHTTPClientWithIdentitySessionCookie(t, ctx, reg, id)
 			check(t, expectSuccess(t, nil, false, false, values), email, cl, func(_ *http.Client, req *http.Request) (*http.Response, error) {
-				_, res := testhelpers.MockMakeAuthenticatedRequestWithClientAndID(t, reg, conf, publicRouter.Router, req, cl, id)
+				_, res := testhelpers.MockMakeAuthenticatedRequestWithClientAndID(t, reg, conf, publicRouter, req, cl, id)
 				return res, nil
 			})
 		})

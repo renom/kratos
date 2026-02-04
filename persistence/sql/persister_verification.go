@@ -8,19 +8,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/persistence/sql/update"
-
-	"github.com/gobuffalo/pop/v6"
-	"github.com/gofrs/uuid"
-
-	"github.com/ory/x/otelx"
-	"github.com/ory/x/sqlcon"
-
 	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/selfservice/strategy/link"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/otelx"
+	"github.com/ory/x/sqlcon"
 )
 
 var _ verification.FlowPersister = new(Persister)
@@ -124,16 +121,13 @@ func (p *Persister) DeleteExpiredVerificationFlows(ctx context.Context, expiresA
 	defer otelx.End(span, &err)
 	//#nosec G201 -- TableName is static
 	err = p.GetConnection(ctx).RawQuery(fmt.Sprintf(
-		"DELETE FROM %s WHERE id in (SELECT id FROM (SELECT id FROM %s c WHERE expires_at <= ? and nid = ? ORDER BY expires_at ASC LIMIT %d ) AS s )",
-		new(verification.Flow).TableName(ctx),
-		new(verification.Flow).TableName(ctx),
-		limit,
+		"DELETE FROM %[1]s WHERE id in (SELECT id FROM (SELECT id FROM %[1]s c WHERE expires_at <= ? and nid = ? ORDER BY expires_at ASC LIMIT ?) AS s)",
+		verification.Flow{}.TableName(),
 	),
 		expiresAt,
 		p.NetworkID(ctx),
+		limit,
 	).Exec()
-	if err != nil {
-		return sqlcon.HandleError(err)
-	}
-	return nil
+
+	return sqlcon.HandleError(err)
 }

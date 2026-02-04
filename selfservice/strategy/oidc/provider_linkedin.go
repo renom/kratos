@@ -120,7 +120,7 @@ func (l *ProviderLinkedIn) fetch(ctx context.Context, client *retryablehttp.Clie
 		return errors.WithStack(err)
 	}
 
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if err := logUpstreamError(l.reg.Logger(), res); err != nil {
 		return err
 	}
@@ -177,18 +177,18 @@ func (l *ProviderLinkedIn) Claims(ctx context.Context, exchange *oauth2.Token, q
 
 	o, err := l.OAuth2(ctx)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, err
 	}
 
 	ctx, client := httpx.SetOAuth2(ctx, l.reg.HTTPClient(ctx), o, exchange)
 	profile, err := l.Profile(ctx, client)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	email, err := l.Email(ctx, client)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	claims := &Claims{

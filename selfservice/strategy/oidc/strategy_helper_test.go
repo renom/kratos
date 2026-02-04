@@ -15,12 +15,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/julienschmidt/httprouter"
+
 	"github.com/phayes/freeport"
 	"github.com/pkg/errors"
 	"github.com/rakutentech/jwk-go/jwk"
@@ -120,7 +121,7 @@ func createClient(t *testing.T, remote string, redir []string) (id, secret strin
 		if err != nil {
 			return err
 		}
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 
 		body := ioutilx.MustReadAll(res.Body)
 		if http.StatusCreated != res.StatusCode {
@@ -135,7 +136,7 @@ func createClient(t *testing.T, remote string, redir []string) (id, secret strin
 }
 
 func newHydraIntegration(t *testing.T, remote *string, subject *string, claims *idTokenClaims, scope *[]string, addr string) (*http.Server, string) {
-	router := httprouter.New()
+	router := http.NewServeMux()
 
 	type p struct {
 		Subject    string          `json:"subject,omitempty"`
@@ -150,7 +151,7 @@ func newHydraIntegration(t *testing.T, remote *string, subject *string, claims *
 
 		res, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 
 		body := ioutilx.MustReadAll(res.Body)
 		require.Equal(t, http.StatusOK, res.StatusCode, "%s", body)
@@ -164,7 +165,7 @@ func newHydraIntegration(t *testing.T, remote *string, subject *string, claims *
 		http.Redirect(w, r, response.RedirectTo, http.StatusSeeOther)
 	}
 
-	router.GET("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) {
 		require.NotEmpty(t, *remote)
 		require.NotEmpty(t, *subject)
 
@@ -179,7 +180,7 @@ func newHydraIntegration(t *testing.T, remote *string, subject *string, claims *
 		do(w, r, href, &b)
 	})
 
-	router.GET("/consent", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /consent", func(w http.ResponseWriter, r *http.Request) {
 		require.NotEmpty(t, *remote)
 		require.NotNil(t, *scope)
 
@@ -206,8 +207,10 @@ func newHydraIntegration(t *testing.T, remote *string, subject *string, claims *
 
 	listener, err := net.Listen("tcp", ":"+parsed.Port())
 	require.NoError(t, err, "port busy?")
-	server := &http.Server{Handler: router}
-	go server.Serve(listener)
+	server := &http.Server{Handler: router} // #nosec G112 -- test code
+	go func() {
+		_ = server.Serve(listener)
+	}()
 	t.Cleanup(func() {
 		assert.NoError(t, server.Close())
 	})
@@ -235,11 +238,12 @@ func newUI(t *testing.T, reg driver.Registry) *httptest.Server {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var e interface{}
 		var err error
-		if r.URL.Path == "/login" {
+		switch r.URL.Path {
+		case "/login":
 			e, err = reg.LoginFlowPersister().GetLoginFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("flow")))
-		} else if r.URL.Path == "/registration" {
+		case "/registration":
 			e, err = reg.RegistrationFlowPersister().GetRegistrationFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("flow")))
-		} else if r.URL.Path == "/settings" {
+		case "/settings":
 			e, err = reg.SettingsFlowPersister().GetSettingsFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("flow")))
 		}
 
@@ -272,7 +276,7 @@ func newHydra(t *testing.T, subject *string, claims *idTokenClaims, scope *[]str
 		hydra, err := pool.RunWithOptions(&dockertest.RunOptions{
 			Repository: "oryd/hydra",
 			// Keep tag in sync with the version in ci.yaml
-			Tag: "v2.2.0@sha256:6c0f9195fe04ae16b095417b323881f8c9008837361160502e11587663b37c09",
+			Tag: "v2.2.0-rc.3",
 			Env: []string{
 				"DSN=memory",
 				fmt.Sprintf("URLS_SELF_ISSUER=http://localhost:%d/", publicPort),
@@ -284,7 +288,8 @@ func newHydra(t *testing.T, subject *string, claims *idTokenClaims, scope *[]str
 			Cmd:          []string{"serve", "all", "--dev"},
 			ExposedPorts: []string{"4444/tcp", "4445/tcp"},
 			PortBindings: map[docker.Port][]docker.PortBinding{
-				"4444/tcp": {{HostPort: fmt.Sprintf("%d/tcp", publicPort)}},
+				"4444/tcp": {{HostIP: "", HostPort: strconv.Itoa(publicPort)}},
+				"4445/tcp": {{HostIP: "", HostPort: ""}}, // Let Docker assign random port
 			},
 		})
 		require.NoError(t, err)
@@ -303,22 +308,23 @@ func newHydra(t *testing.T, subject *string, claims *idTokenClaims, scope *[]str
 			pr := remotePublic + "/health/ready"
 			res, err := http.DefaultClient.Get(pr)
 			if err != nil || res.StatusCode != 200 {
-				return errors.Errorf("Hydra public is not ready at " + pr)
+				return errors.Errorf("Hydra public is not ready at %s", pr)
 			}
 
 			wellKnown := remotePublic + "/.well-known/openid-configuration"
 			res, err = http.DefaultClient.Get(wellKnown)
 			if err != nil || res.StatusCode != 200 {
-				return errors.Errorf("Hydra .well-known is not ready at " + wellKnown)
+				return errors.Errorf("Hydra .well-known is not ready at %s", wellKnown)
 			}
 
 			ar := remoteAdmin + "/health/ready"
 			res, err = http.DefaultClient.Get(ar)
-			if err != nil && res.StatusCode != 200 {
-				return errors.Errorf("Hydra admin is not ready at " + ar)
-			} else {
-				return nil
+			if err != nil {
+				return errors.Errorf("Hydra admin is not ready at %s", ar)
+			} else if res.StatusCode != 200 {
+				return errors.Errorf("Hydra admin is not ready at %s", ar)
 			}
+			return nil
 		})
 		require.NoError(t, err)
 

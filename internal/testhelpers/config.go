@@ -8,13 +8,12 @@ import (
 	"encoding/base64"
 	"testing"
 
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/x/configx"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/randx"
 )
 
@@ -35,7 +34,7 @@ func DefaultIdentitySchemaConfig(url string) map[string]any {
 }
 
 func WithDefaultIdentitySchema(ctx context.Context, url string) context.Context {
-	return confighelpers.WithConfigValues(ctx, DefaultIdentitySchemaConfig(url))
+	return contextx.WithConfigValues(ctx, DefaultIdentitySchemaConfig(url))
 }
 
 // Deprecated: Use context-based WithDefaultIdentitySchema instead
@@ -53,14 +52,12 @@ func SetDefaultIdentitySchema(conf *config.Config, url string) func() {
 }
 
 // WithAddIdentitySchema registers an identity schema in the config with a random ID and returns the ID
-//
-// It also registers a test cleanup function, to reset the schemas to the original values, after the test finishes
 func WithAddIdentitySchema(ctx context.Context, t *testing.T, conf *config.Config, url string) (context.Context, string) {
 	id := randx.MustString(16, randx.Alpha)
 	schemas, err := conf.IdentityTraitsSchemas(ctx)
 	require.NoError(t, err)
 
-	return confighelpers.WithConfigValue(ctx, config.ViperKeyIdentitySchemas, append(schemas, config.Schema{
+	return contextx.WithConfigValue(ctx, config.ViperKeyIdentitySchemas, append(schemas, config.Schema{
 		ID:  id,
 		URL: url,
 	})), id

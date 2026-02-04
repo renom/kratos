@@ -8,16 +8,12 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ory/kratos/x/events"
-
-	"github.com/ory/x/crdbx"
-
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -33,7 +29,10 @@ import (
 	"github.com/ory/kratos/persistence/sql/update"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/events"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/contextx"
+	"github.com/ory/x/crdbx"
 	"github.com/ory/x/errorsx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/pagination/keysetpagination"
@@ -131,17 +130,14 @@ func NormalizeIdentifier(ct identity.CredentialsType, match string) string {
 	case identity.CredentialsTypeTOTP:
 		// totp credentials are case-sensitive
 		return match
-	case identity.CredentialsTypeOIDC:
+	case identity.CredentialsTypeOIDC, identity.CredentialsTypeSAML:
 		// OIDC credentials are case-sensitive
 		return match
-	case identity.CredentialsTypePassword:
-		fallthrough
-	case identity.CredentialsTypeCodeAuth:
-		fallthrough
-	case identity.CredentialsTypeWebAuthn:
+	case identity.CredentialsTypePassword, identity.CredentialsTypeCodeAuth, identity.CredentialsTypeWebAuthn:
 		return stringToLowerTrim(match)
+	default:
+		return match
 	}
-	return match
 }
 
 func (p *IdentityPersister) FindIdentityByCredentialIdentifier(ctx context.Context, identifier string, caseSensitive bool) (_ *identity.Identity, err error) {
@@ -251,15 +247,18 @@ func (p *IdentityPersister) FindIdentityByWebauthnUserHandle(ctx context.Context
 	var id identity.Identity
 
 	var jsonPath string
-	switch p.GetConnection(ctx).Dialect.Name() {
+	con := p.GetConnection(ctx)
+	switch con.Dialect.Name() {
 	case "sqlite", "mysql":
 		jsonPath = "$.user_handle"
 	default:
 		jsonPath = "user_handle"
 	}
 
-	if err := p.GetConnection(ctx).RawQuery(fmt.Sprintf(`
-SELECT identities.*
+	columns := popx.DBColumns[identity.Identity](&popx.AliasQuoter{Alias: "identities", Quoter: con.Dialect})
+
+	if err := con.RawQuery(fmt.Sprintf(`
+SELECT %s
 FROM identities
 INNER JOIN identity_credentials
     ON  identities.id = identity_credentials.identity_id
@@ -271,7 +270,8 @@ INNER JOIN identity_credentials
      )
 WHERE identity_credentials.config ->> '%s' = ? AND identity_credentials.config ->> '%s' IS NOT NULL
   AND identities.nid = ?
-LIMIT 1`, jsonPath, jsonPath),
+LIMIT 1`, columns,
+		jsonPath, jsonPath),
 		identity.CredentialsTypeWebAuthn,
 		base64.StdEncoding.EncodeToString(userHandle),
 		p.NetworkID(ctx),
@@ -280,36 +280,6 @@ LIMIT 1`, jsonPath, jsonPath),
 	}
 
 	return &id, nil
-}
-
-var credentialsTypes = struct {
-	sync.RWMutex
-	m map[identity.CredentialsType]*identity.CredentialsTypeTable
-}{
-	m: map[identity.CredentialsType]*identity.CredentialsTypeTable{},
-}
-
-func (p *IdentityPersister) findIdentityCredentialsType(ctx context.Context, ct identity.CredentialsType) (_ *identity.CredentialsTypeTable, err error) {
-	credentialsTypes.RLock()
-	v, ok := credentialsTypes.m[ct]
-	credentialsTypes.RUnlock()
-
-	if ok && v != nil {
-		return v, nil
-	}
-
-	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.findIdentityCredentialsType")
-	defer otelx.End(span, &err)
-
-	var m identity.CredentialsTypeTable
-	if err := p.GetConnection(ctx).Where("name = ?", ct).First(&m); err != nil {
-		return nil, sqlcon.HandleError(err)
-	}
-	credentialsTypes.Lock()
-	credentialsTypes.m[ct] = &m
-	credentialsTypes.Unlock()
-
-	return &m, nil
 }
 
 func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, conn *pop.Connection, identities ...*identity.Identity) (err error) {
@@ -339,7 +309,7 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, conn 
 				cred.Config = sqlxx.JSONRawMessage("{}")
 			}
 
-			ct, err := p.findIdentityCredentialsType(ctx, cred.Type)
+			ct, err := FindIdentityCredentialsTypeByName(conn, cred.Type)
 			if err != nil {
 				return err
 			}
@@ -350,7 +320,7 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, conn 
 			}
 			cred.IdentityID = ident.ID
 			cred.NID = nid
-			cred.IdentityCredentialTypeID = ct.ID
+			cred.IdentityCredentialTypeID = ct
 			credentials = append(credentials, &cred)
 
 			ident.Credentials[k] = cred
@@ -366,11 +336,11 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, conn 
 			identifier = NormalizeIdentifier(cred.Type, identifier)
 
 			if identifier == "" {
-				return errors.WithStack(herodot.ErrInternalServerError.WithReasonf(
+				return errors.WithStack(herodot.ErrMisconfiguration.WithReasonf(
 					"Unable to create identity credentials with missing or empty identifier."))
 			}
 
-			ct, err := p.findIdentityCredentialsType(ctx, cred.Type)
+			ct, err := FindIdentityCredentialsTypeByName(conn, cred.Type)
 			if err != nil {
 				return err
 			}
@@ -378,7 +348,7 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, conn 
 			identifiers = append(identifiers, &identity.CredentialIdentifier{
 				Identifier:                identifier,
 				IdentityCredentialsID:     cred.ID,
-				IdentityCredentialsTypeID: ct.ID,
+				IdentityCredentialsTypeID: ct,
 				NID:                       p.NetworkID(ctx),
 			})
 		}
@@ -412,10 +382,54 @@ func (p *IdentityPersister) createVerifiableAddresses(ctx context.Context, conn 
 	return batch.Create(ctx, &batch.TracerConnection{Tracer: p.r.Tracer(ctx), Connection: conn}, work, opts...)
 }
 
-func updateAssociation[T interface {
-	Hash() string
-}](ctx context.Context, p *IdentityPersister, i *identity.Identity, inID []T,
-) (err error) {
+type differ interface {
+	Signature() string
+	GetID() uuid.UUID
+}
+
+func updateAssociationWith[T differ](ctx context.Context, p *IdentityPersister, fromDatabase, updateTo []T,
+) (result []T, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateAssociationWith",
+		trace.WithAttributes(
+			attribute.Stringer("network.id", p.NetworkID(ctx))))
+	defer otelx.End(span, &err)
+
+	toKeep, toCreate, toRemoveIDs := diffAssociations(fromDatabase, updateTo)
+
+	// Subtle: we delete the old associations from the DB first, because else
+	// they could cause UNIQUE constraints to fail on insert.
+	// Foreign key cascade will take care of deleting dependent records.
+	if len(toRemoveIDs) > 0 {
+		if err := p.GetConnection(ctx).Where("id IN (?)", toRemoveIDs).Where("nid = ?", p.NetworkID(ctx)).Delete(new(T)); err != nil {
+			return nil, sqlcon.HandleError(err)
+		}
+	}
+
+	if len(toCreate) > 0 {
+		if err := batch.Create(ctx,
+			&batch.TracerConnection{
+				Tracer:     p.r.Tracer(ctx),
+				Connection: p.GetConnection(ctx),
+			},
+			toCreate,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	result = make([]T, 0, len(toKeep)+len(toCreate))
+	for _, v := range toKeep {
+		result = append(result, *v)
+	}
+	for _, v := range toCreate {
+		result = append(result, *v)
+	}
+
+	return result, nil
+}
+
+func updateAssociation[T differ](ctx context.Context, p *IdentityPersister, i *identity.Identity, inID []T,
+) (result []T, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateAssociation",
 		trace.WithAttributes(
 			attribute.Stringer("identity.id", i.ID),
@@ -426,39 +440,98 @@ func updateAssociation[T interface {
 	if err := p.GetConnection(ctx).
 		Where("identity_id = ? AND nid = ?", i.ID, p.NetworkID(ctx)).
 		All(&inDB); err != nil {
-		return sqlcon.HandleError(err)
+		return nil, sqlcon.HandleError(err)
 	}
 
-	newAssocs := make(map[string]*T)
-	oldAssocs := make(map[string]*T)
-	for i, a := range inID {
-		newAssocs[a.Hash()] = &inID[i]
-	}
-	for i, a := range inDB {
-		oldAssocs[a.Hash()] = &inDB[i]
+	return updateAssociationWith(ctx, p, inDB, inID)
+}
+
+func updateCredentialsAssociation(ctx context.Context, p *IdentityPersister, conn *pop.Connection, identityID uuid.UUID, fromDatabase []identity.Credentials, updateTo []identity.Credentials) (result map[identity.CredentialsType]identity.Credentials, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateCredentialsAssociation",
+		trace.WithAttributes(
+			attribute.Stringer("identity.id", identityID),
+			attribute.Stringer("network.id", p.NetworkID(ctx))))
+	defer otelx.End(span, &err)
+
+	nid := p.NetworkID(ctx)
+
+	// Normalize new credentials by ensuring IdentityID, NID, and identifiers are set before hashing
+	for i := range updateTo {
+		updateTo[i].IdentityID = identityID
+		updateTo[i].NID = nid
+		// Normalize identifiers to match what's stored in the database (make a copy to avoid modifying original)
+		normalizedIdentifiers := make([]string, len(updateTo[i].Identifiers))
+		for j, identifier := range updateTo[i].Identifiers {
+			normalizedIdentifiers[j] = NormalizeIdentifier(updateTo[i].Type, identifier)
+		}
+		updateTo[i].Identifiers = normalizedIdentifiers
 	}
 
-	// Subtle: we delete the old associations from the DB first, because else
-	// they could cause UNIQUE constraints to fail on insert.
+	credsToKeep, newCreds, credsToDeleteIDs := diffAssociations(fromDatabase, updateTo)
+
+	if len(credsToDeleteIDs) > 0 {
+		// Delete the credential and its identifiers.
+		if err := conn.RawQuery(
+			`DELETE FROM identity_credentials WHERE nid = ? AND id IN (?)`,
+			nid,
+			credsToDeleteIDs,
+		).Exec(); err != nil {
+			return nil, sqlcon.HandleError(err)
+		}
+	}
+
+	// Create new credentials that aren't already in the database
+	credsToCreate := make(map[identity.CredentialsType]identity.Credentials, len(newCreds))
+	for _, c := range newCreds {
+		credsToCreate[c.Type] = *c
+	}
+
+	if len(credsToCreate) > 0 {
+		if err := p.createIdentityCredentials(ctx, conn, &identity.Identity{
+			ID:          identityID,
+			Credentials: credsToCreate,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	result = make(map[identity.CredentialsType]identity.Credentials, len(credsToKeep)+len(credsToCreate))
+	for _, c := range credsToKeep {
+		result[c.Type] = *c
+	}
+	maps.Copy(result, credsToCreate)
+
+	return result, nil
+}
+
+func diffAssociations[T differ](fromDatabase, updateTo []T) (unchanged, toCreate []*T, toRemoveIDs []uuid.UUID) {
+	newAssocs := make(map[string]*T, len(updateTo))
+	oldAssocs := make(map[string]*T, len(fromDatabase))
+	for i, a := range updateTo {
+		newAssocs[a.Signature()] = &updateTo[i]
+	}
+	for i, a := range fromDatabase {
+		oldAssocs[a.Signature()] = &fromDatabase[i]
+	}
+
+	toRemoveIDs = make([]uuid.UUID, 0, len(fromDatabase))
+	toCreate = make([]*T, 0, len(updateTo))
+	unchanged = make([]*T, 0, len(updateTo))
+
 	for h, a := range oldAssocs {
 		if _, found := newAssocs[h]; found {
-			newAssocs[h] = nil // Ignore associations that are already in the db.
+			delete(newAssocs, h)
+			unchanged = append(unchanged, a)
 		} else {
-			if err := p.GetConnection(ctx).Destroy(a); err != nil {
-				return sqlcon.HandleError(err)
-			}
+			toRemoveIDs = append(toRemoveIDs, (*a).GetID())
 		}
 	}
 
 	for _, a := range newAssocs {
-		if a != nil {
-			if err := p.GetConnection(ctx).Create(a); err != nil {
-				return sqlcon.HandleError(err)
-			}
-		}
+		toCreate = append(toCreate, a)
 	}
 
-	return nil
+	return
 }
 
 func (p *IdentityPersister) normalizeAllAddressess(ctx context.Context, identities ...*identity.Identity) {
@@ -585,62 +658,74 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 	}
 
 	var succeededIDs []uuid.UUID
-
-	defer func() {
-		// Report succeeded identities as created.
-		for _, identID := range succeededIDs {
-			span.AddEvent(events.NewIdentityCreated(ctx, identID))
-		}
-	}()
-
-	return p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
+	var partialErr *identity.CreateIdentitiesError
+	if err := p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
 		conn := &batch.TracerConnection{
 			Tracer:     p.r.Tracer(ctx),
 			Connection: tx,
 		}
 
 		succeededIDs = make([]uuid.UUID, 0, len(identities))
-		failedIdentityIDs := make(map[uuid.UUID]struct{})
+		failedIdentityIDs := make(map[uuid.UUID]struct{ created bool })
+		partialErr = nil
+		createdIdentities := make([]*identity.Identity, 0, len(identities))
 
-		// Don't use batch.WithPartialInserts, because identities have no other
-		// constraints other than the primary key that could cause conflicts.
-		if err := batch.Create(ctx, conn, identities); err != nil {
-			return sqlcon.HandleError(err)
+		var opts []batch.CreateOpts
+		if len(identities) > 1 {
+			opts = append(opts, batch.WithPartialInserts)
+		}
+		if err := batch.Create(ctx, conn, identities, opts...); err != nil {
+			if partialErr := new(batch.PartialConflictError[identity.Identity]); errors.As(err, &partialErr) {
+				for _, k := range partialErr.Failed {
+					failedIdentityIDs[k.ID] = struct{ created bool }{false}
+				}
+
+				// Mark all created identities that were not in the failed list as created.
+				for _, ident := range identities {
+					if _, ok := failedIdentityIDs[ident.ID]; !ok {
+						createdIdentities = append(createdIdentities, ident)
+					}
+				}
+			} else {
+				return sqlcon.HandleError(err)
+			}
+		} else {
+			// If no errors occurred, we can safely assume all identities were created.
+			createdIdentities = identities
 		}
 
-		p.normalizeAllAddressess(ctx, identities...)
+		p.normalizeAllAddressess(ctx, createdIdentities...)
 
-		if err = p.createVerifiableAddresses(ctx, tx, identities...); err != nil {
-			if paritalErr := new(batch.PartialConflictError[identity.VerifiableAddress]); errors.As(err, &paritalErr) {
-				for _, k := range paritalErr.Failed {
-					failedIdentityIDs[k.IdentityID] = struct{}{}
+		if err = p.createVerifiableAddresses(ctx, tx, createdIdentities...); err != nil {
+			if partialErr := new(batch.PartialConflictError[identity.VerifiableAddress]); errors.As(err, &partialErr) {
+				for _, k := range partialErr.Failed {
+					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
 				}
 			} else {
 				return sqlcon.HandleError(err)
 			}
 		}
-		if err = p.createRecoveryAddresses(ctx, tx, identities...); err != nil {
-			if paritalErr := new(batch.PartialConflictError[identity.RecoveryAddress]); errors.As(err, &paritalErr) {
-				for _, k := range paritalErr.Failed {
-					failedIdentityIDs[k.IdentityID] = struct{}{}
+		if err = p.createRecoveryAddresses(ctx, tx, createdIdentities...); err != nil {
+			if partialErr := new(batch.PartialConflictError[identity.RecoveryAddress]); errors.As(err, &partialErr) {
+				for _, k := range partialErr.Failed {
+					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
 				}
 			} else {
 				return sqlcon.HandleError(err)
 			}
 		}
-		if err = p.createIdentityCredentials(ctx, tx, identities...); err != nil {
-			if paritalErr := new(batch.PartialConflictError[identity.Credentials]); errors.As(err, &paritalErr) {
-				for _, k := range paritalErr.Failed {
-					failedIdentityIDs[k.IdentityID] = struct{}{}
+		if err = p.createIdentityCredentials(ctx, tx, createdIdentities...); err != nil {
+			if partialErr := new(batch.PartialConflictError[identity.Credentials]); errors.As(err, &partialErr) {
+				for _, k := range partialErr.Failed {
+					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
 				}
-
-			} else if paritalErr := new(batch.PartialConflictError[identity.CredentialIdentifier]); errors.As(err, &paritalErr) {
-				for _, k := range paritalErr.Failed {
+			} else if partialErr := new(batch.PartialConflictError[identity.CredentialIdentifier]); errors.As(err, &partialErr) {
+				for _, k := range partialErr.Failed {
 					credID := k.IdentityCredentialsID
 					for _, ident := range identities {
 						for _, cred := range ident.Credentials {
 							if cred.ID == credID {
-								failedIdentityIDs[ident.ID] = struct{}{}
+								failedIdentityIDs[ident.ID] = struct{ created bool }{true}
 							}
 						}
 					}
@@ -651,26 +736,28 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 		}
 
 		// If any of the batch inserts failed on conflict, let's delete the corresponding
-		// identities and return a list of failed identities in the error.
+		// identity and return a list of failed identities in the error.
 		if len(failedIdentityIDs) > 0 {
-			partialErr := &identity.CreateIdentitiesError{}
-			failedIDs := make([]uuid.UUID, 0, len(failedIdentityIDs))
+			partialErr = identity.NewCreateIdentitiesError(len(failedIdentityIDs))
+			idsToBeRemoved := make([]uuid.UUID, 0, len(failedIdentityIDs))
 
 			for _, ident := range identities {
-				if _, ok := failedIdentityIDs[ident.ID]; ok {
+				if info, ok := failedIdentityIDs[ident.ID]; ok {
 					partialErr.AddFailedIdentity(ident, sqlcon.ErrUniqueViolation)
-					failedIDs = append(failedIDs, ident.ID)
+					if info.created {
+						idsToBeRemoved = append(idsToBeRemoved, ident.ID)
+					}
 				} else {
 					succeededIDs = append(succeededIDs, ident.ID)
 				}
 			}
 			// Manually roll back by deleting the identities that were inserted before the
 			// error occurred.
-			if err := p.DeleteIdentities(ctx, failedIDs); err != nil {
+			if err := p.DeleteIdentities(ctx, idsToBeRemoved); err != nil {
 				return sqlcon.HandleError(err)
 			}
 
-			return partialErr
+			return nil
 		} else {
 			// No failures: report all identities as created.
 			for _, ident := range identities {
@@ -679,7 +766,16 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 		}
 
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Report succeeded identities as created.
+	for _, identID := range succeededIDs {
+		span.AddEvent(events.NewIdentityCreated(ctx, identID))
+	}
+
+	return partialErr.ErrOrNil()
 }
 
 func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *identity.Identity, expand identity.Expandables) (err error) {
@@ -689,10 +785,7 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
 
-	var (
-		con = p.GetConnection(ctx)
-		nid = p.NetworkID(ctx)
-	)
+	nid := p.NetworkID(ctx)
 
 	eg, ctx := errgroup.WithContext(ctx)
 	if expand.Has(identity.ExpandFieldRecoveryAddresses) {
@@ -700,8 +793,8 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 			// We use WithContext to get a copy of the connection struct, which solves the race detector
 			// from complaining incorrectly.
 			//
-			// https://github.com/gobuffalo/pop/issues/723
-			if err := con.WithContext(ctx).
+			// https://github.com/ory/pop/issues/723
+			if err := p.GetConnection(ctx).WithContext(ctx).
 				Where("identity_id = ? AND nid = ?", i.ID, nid).
 				Order("id ASC").
 				All(&i.RecoveryAddresses); err != nil {
@@ -716,8 +809,8 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 			// We use WithContext to get a copy of the connection struct, which solves the race detector
 			// from complaining incorrectly.
 			//
-			// https://github.com/gobuffalo/pop/issues/723
-			if err := con.WithContext(ctx).
+			// https://github.com/ory/pop/issues/723
+			if err := p.GetConnection(ctx).WithContext(ctx).
 				Order("id ASC").
 				Where("identity_id = ? AND nid = ?", i.ID, nid).
 				All(&i.VerifiableAddresses); err != nil {
@@ -732,10 +825,10 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 			// We use WithContext to get a copy of the connection struct, which solves the race detector
 			// from complaining incorrectly.
 			//
-			// https://github.com/gobuffalo/pop/issues/723
-			con := con.WithContext(ctx)
-			creds, err := QueryForCredentials(con,
-				Where{"(identity_credentials.identity_id = ? AND identity_credentials.nid = ?)", []interface{}{i.ID, nid}})
+			// https://github.com/ory/pop/issues/723
+			creds, err := QueryForCredentials(p.GetConnection(ctx).WithContext(ctx),
+				Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
+				Where{"identity_credentials.nid = ?", []interface{}{nid}})
 			if err != nil {
 				return err
 			}
@@ -760,16 +853,8 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 }
 
 type queryCredentials struct {
-	ID         uuid.UUID                `db:"cred_id"`
-	IdentityID uuid.UUID                `db:"identity_id"`
-	NID        uuid.UUID                `db:"nid"`
-	Type       identity.CredentialsType `db:"cred_type"`
-	TypeID     uuid.UUID                `db:"cred_type_id"`
-	Identifier string                   `db:"cred_identifier"`
-	Config     sqlxx.JSONRawMessage     `db:"cred_config"`
-	Version    int                      `db:"cred_version"`
-	CreatedAt  time.Time                `db:"created_at"`
-	UpdatedAt  time.Time                `db:"updated_at"`
+	Identifier string `db:"cred_identifier"`
+	identity.Credentials
 }
 
 func (queryCredentials) TableName() string {
@@ -783,35 +868,23 @@ type Where struct {
 
 // QueryForCredentials queries for identity credentials with custom WHERE
 // clauses, returning the results resolved by the owning identity's UUID.
-func QueryForCredentials(con *pop.Connection, where ...Where) (map[uuid.UUID](map[identity.CredentialsType]identity.Credentials), error) {
-	ici := "identity_credential_identifiers"
-	switch con.Dialect.Name() {
-	case "cockroach":
-		ici += "@identity_credential_identifiers_nid_identity_credential_id_idx"
-	case "sqlite3":
-		ici += " INDEXED BY identity_credential_identifiers_nid_identity_credential_id_idx"
-	case "mysql":
-		ici += " USE INDEX(identity_credential_identifiers_nid_identity_credential_id_idx)"
-	default:
-		// good luck 🤷‍♂️
-	}
+func QueryForCredentials(con *pop.Connection, where ...Where) (credentialsPerIdentity map[uuid.UUID](map[identity.CredentialsType]identity.Credentials), err error) {
+	// This query has been meticulously crafted to be as fast as possible.
+	// If you touch it, you will likely introduce a performance regression.
 	q := con.Select(
-		"identity_credentials.id cred_id",
-		"identity_credentials.identity_id identity_id",
-		"identity_credentials.nid nid",
-		"ict.name cred_type",
-		"ict.id cred_type_id",
 		"COALESCE(identity_credential_identifiers.identifier, '') cred_identifier",
-		"identity_credentials.config cred_config",
-		"identity_credentials.version cred_version",
-		"identity_credentials.created_at created_at",
-		"identity_credentials.updated_at updated_at",
-	).InnerJoin(
-		"identity_credential_types ict",
-		"(identity_credentials.identity_credential_type_id = ict.id)",
-	).LeftJoin(
-		ici,
+		"identity_credentials.id",
+		"identity_credentials.identity_credential_type_id",
+		"identity_credentials.identity_id",
+		"identity_credentials.nid",
+		"identity_credentials.config",
+		"identity_credentials.version",
+		"identity_credentials.created_at",
+		"identity_credentials.updated_at",
+	).LeftJoin(identifiersTableNameWithIndexHint(con),
 		"identity_credential_identifiers.identity_credential_id = identity_credentials.id AND identity_credential_identifiers.nid = identity_credentials.nid",
+	).Order(
+		"identity_credential_identifiers.identifier ASC",
 	)
 	for _, w := range where {
 		q = q.Where("("+w.Condition+")", w.Args...)
@@ -820,8 +893,16 @@ func QueryForCredentials(con *pop.Connection, where ...Where) (map[uuid.UUID](ma
 	if err := q.All(&results); err != nil {
 		return nil, sqlcon.HandleError(err)
 	}
-	credentialsPerIdentity := map[uuid.UUID](map[identity.CredentialsType]identity.Credentials){}
+
+	// assemble
+	credentialsPerIdentity = map[uuid.UUID](map[identity.CredentialsType]identity.Credentials){}
 	for _, res := range results {
+
+		res.Type, err = FindIdentityCredentialsTypeByID(con, res.IdentityCredentialTypeID)
+		if err != nil {
+			return nil, err
+		}
+
 		credentials, ok := credentialsPerIdentity[res.IdentityID]
 		if !ok {
 			credentialsPerIdentity[res.IdentityID] = make(map[identity.CredentialsType]identity.Credentials)
@@ -834,20 +915,10 @@ func QueryForCredentials(con *pop.Connection, where ...Where) (map[uuid.UUID](ma
 		if identifiers == nil {
 			identifiers = make([]string, 0)
 		}
-		c := identity.Credentials{
-			ID:                       res.ID,
-			IdentityID:               res.IdentityID,
-			NID:                      res.NID,
-			Type:                     res.Type,
-			IdentityCredentialTypeID: res.TypeID,
-			Identifiers:              identifiers,
-			Config:                   res.Config,
-			Version:                  res.Version,
-			CreatedAt:                res.CreatedAt,
-			UpdatedAt:                res.UpdatedAt,
-		}
-		credentials[res.Type] = c
+		res.Identifiers = identifiers
+		credentials[res.Type] = res.Credentials
 	}
+
 	// We need deterministic ordering for testing, but sorting in the
 	// database can be expensive under certain circumstances.
 	for _, creds := range credentialsPerIdentity {
@@ -856,6 +927,21 @@ func QueryForCredentials(con *pop.Connection, where ...Where) (map[uuid.UUID](ma
 		}
 	}
 	return credentialsPerIdentity, nil
+}
+
+func identifiersTableNameWithIndexHint(con *pop.Connection) string {
+	ici := "identity_credential_identifiers"
+	switch con.Dialect.Name() {
+	case "cockroach":
+		ici += "@identity_credential_identifiers_ici_nid_i_idx"
+	case "sqlite3":
+		ici += " INDEXED BY identity_credential_identifiers_ici_nid_i_idx"
+	case "mysql":
+		ici += " USE INDEX(identity_credential_identifiers_ici_nid_i_idx)"
+	default:
+		// good luck 🤷‍♂️
+	}
+	return ici
 }
 
 func paginationAttributes(params *identity.ListIdentityParameters, paginator *keysetpagination.Paginator) []attribute.KeyValue {
@@ -883,11 +969,11 @@ func (p *IdentityPersister) getCredentialTypeIDs(ctx context.Context, credential
 	result := map[identity.CredentialsType]uuid.UUID{}
 
 	for _, ct := range credentialTypes {
-		typeID, err := p.findIdentityCredentialsType(ctx, ct)
+		typeID, err := FindIdentityCredentialsTypeByName(p.GetConnection(ctx), ct)
 		if err != nil {
 			return nil, err
 		}
-		result[ct] = typeID.ID
+		result[ct] = typeID
 	}
 
 	return result, nil
@@ -947,6 +1033,7 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 				identity.CredentialsTypePassword,
 				identity.CredentialsTypeCodeAuth,
 				identity.CredentialsTypeOIDC,
+				identity.CredentialsTypeSAML,
 			})
 			if err != nil {
 				return err
@@ -956,37 +1043,47 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 			// important to normalize the identifier before querying the database.
 
 			joins = params.TransformStatement(`
-			INNER JOIN identity_credentials ic ON ic.identity_id = identities.id
-			INNER JOIN identity_credential_identifiers ici ON ici.identity_credential_id = ic.id`)
+			INNER JOIN identity_credentials ic ON ic.identity_id = identities.id AND ic.nid = identities.nid
+			INNER JOIN identity_credential_identifiers ici ON ici.identity_credential_id = ic.id AND ici.nid = ic.nid
+`)
 
 			wheres += fmt.Sprintf(`
 			AND ic.nid = ? AND ici.nid = ?
-			AND ((ic.identity_credential_type_id IN (?, ?, ?) AND ici.identifier %s ?)
-              OR (ic.identity_credential_type_id IN (?) AND ici.identifier %s ?))
+			AND ((ici.identity_credential_type_id IN (?, ?, ?) AND ici.identifier %s ?)
+              OR (ici.identity_credential_type_id IN (?, ?) AND ici.identifier %s ?))
 			`, identifierOperator, identifierOperator)
 			args = append(args,
 				nid, nid,
 				types[identity.CredentialsTypeWebAuthn], types[identity.CredentialsTypePassword], types[identity.CredentialsTypeCodeAuth],
 				NormalizeIdentifier(identity.CredentialsTypePassword, identifier),
-				types[identity.CredentialsTypeOIDC], identifier,
+				types[identity.CredentialsTypeOIDC], types[identity.CredentialsTypeSAML],
+				identifier,
 			)
 		}
 
-		if params.IdsFilter != nil && len(params.IdsFilter) != 0 {
+		if len(params.IdsFilter) > 0 {
 			wheres += `
 				AND identities.id in (?)
 			`
 			args = append(args, params.IdsFilter)
+		} else if !params.OrganizationID.IsNil() {
+			wheres += `
+				AND identities.organization_id = ?
+			`
+			args = append(args, params.OrganizationID.String())
 		}
 
+		columns := popx.DBColumns[identity.Identity](&popx.AliasQuoter{Alias: "identities", Quoter: con.Dialect})
+
 		query := fmt.Sprintf(`
-		SELECT DISTINCT identities.*
+		SELECT DISTINCT %s
 		FROM identities AS identities
 		%s
 		WHERE
 		%s
 		ORDER BY identities.id ASC
 		%s`,
+			columns,
 			joins, wheres, limit)
 
 		if err := con.RawQuery(query, args...).All(&is); err != nil {
@@ -1012,7 +1109,7 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 			switch e {
 			case identity.ExpandFieldCredentials:
 				creds, err := QueryForCredentials(con,
-					Where{"identity_credentials.nid = ?", []any{nid}},
+					Where{"identity_credentials.nid = ?", []interface{}{nid}},
 					Where{"identity_credentials.identity_id IN (?)", identityIDs})
 				if err != nil {
 					return err
@@ -1022,7 +1119,7 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 				}
 			case identity.ExpandFieldVerifiableAddresses:
 				addrs := make([]identity.VerifiableAddress, 0)
-				if err := con.Where("nid = ?", nid).Where("identity_id IN (?)", identityIDs).Order("id").All(&addrs); err != nil {
+				if err := con.Where("identity_id IN (?)", identityIDs).Where("nid = ?", nid).Order("id").All(&addrs); err != nil {
 					return sqlcon.HandleError(err)
 				}
 				for _, addr := range addrs {
@@ -1030,7 +1127,7 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 				}
 			case identity.ExpandFieldRecoveryAddresses:
 				addrs := make([]identity.RecoveryAddress, 0)
-				if err := con.Where("nid = ?", nid).Where("identity_id IN (?)", identityIDs).Order("id").All(&addrs); err != nil {
+				if err := con.Where("identity_id IN (?)", identityIDs).Where("nid = ?", nid).Order("id").All(&addrs); err != nil {
 					return sqlcon.HandleError(err)
 				}
 				for _, addr := range addrs {
@@ -1072,7 +1169,7 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 }
 
 func (p *IdentityPersister) UpdateIdentityColumns(ctx context.Context, i *identity.Identity, columns ...string) (err error) {
-	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateIdentity",
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateIdentityColumns",
 		trace.WithAttributes(
 			attribute.Stringer("identity.id", i.ID),
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
@@ -1089,7 +1186,7 @@ func (p *IdentityPersister) UpdateIdentityColumns(ctx context.Context, i *identi
 	return nil
 }
 
-func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Identity) (err error) {
+func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Identity, mods ...identity.UpdateIdentityModifier) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateIdentity",
 		trace.WithAttributes(
 			attribute.Stringer("identity.id", i.ID),
@@ -1100,6 +1197,8 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 		return err
 	}
 
+	o := identity.NewUpdateIdentityOptions(mods)
+
 	i.NID = p.NetworkID(ctx)
 	i.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
 	if err := sqlcon.HandleError(p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
@@ -1108,25 +1207,56 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 			return err
 		}
 
+		var identityCreds map[identity.CredentialsType]identity.Credentials
 		p.normalizeAllAddressess(ctx, i)
-		if err := updateAssociation(ctx, p, i, i.RecoveryAddresses); err != nil {
-			return err
+		if o.FromDatabase() != nil {
+			if o.FromDatabase().ID != i.ID {
+				return errors.New("mismatched identity ID: this is a bug")
+			}
+			var err error
+			i.RecoveryAddresses, err = updateAssociationWith(ctx, p, o.FromDatabase().RecoveryAddresses, i.RecoveryAddresses)
+			if err != nil {
+				return err
+			}
+			i.VerifiableAddresses, err = updateAssociationWith(ctx, p, o.FromDatabase().VerifiableAddresses, i.VerifiableAddresses)
+			if err != nil {
+				return err
+			}
+			identityCreds = o.FromDatabase().Credentials
+		} else {
+			i.RecoveryAddresses, err = updateAssociation(ctx, p, i, i.RecoveryAddresses)
+			if err != nil {
+				return err
+			}
+			i.VerifiableAddresses, err = updateAssociation(ctx, p, i, i.VerifiableAddresses)
+			if err != nil {
+				return err
+			}
+
+			creds, err := QueryForCredentials(tx,
+				Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
+				Where{"identity_credentials.nid = ?", []interface{}{p.NetworkID(ctx)}})
+			if err != nil {
+				return err
+			}
+			if c, found := creds[i.ID]; found {
+				identityCreds = c
+			}
 		}
 
-		if err := updateAssociation(ctx, p, i, i.VerifiableAddresses); err != nil {
-			return err
+		oldCredentials := make([]identity.Credentials, 0, len(identityCreds))
+		for _, cred := range identityCreds {
+			oldCredentials = append(oldCredentials, cred)
 		}
 
-		// #nosec G201 -- TableName is static
-		if err := tx.RawQuery(
-			fmt.Sprintf(
-				`DELETE FROM %s WHERE identity_id = ? AND nid = ?`,
-				new(identity.Credentials).TableName(ctx)),
-			i.ID, p.NetworkID(ctx)).Exec(); err != nil {
-			return sqlcon.HandleError(err)
+		// Convert new credentials map to slice
+		newCredentials := make([]identity.Credentials, 0, len(i.Credentials))
+		for _, cred := range i.Credentials {
+			newCredentials = append(newCredentials, cred)
 		}
 
-		return sqlcon.HandleError(p.createIdentityCredentials(ctx, tx, i))
+		i.Credentials, err = updateCredentialsAssociation(ctx, p, tx, i.ID, oldCredentials, newCredentials)
+		return err
 	})); err != nil {
 		return err
 	}
@@ -1162,6 +1292,10 @@ func (p *IdentityPersister) DeleteIdentity(ctx context.Context, id uuid.UUID) (e
 }
 
 func (p *IdentityPersister) DeleteIdentities(ctx context.Context, ids []uuid.UUID) (err error) {
+	// This function is only used internally to cleanup partially created identities,
+	// when creating a batch of identities at once and some failed to be fully created.
+	// This act should not be observable externally and thus we do not emit an event.
+
 	stringIDs := make([]string, len(ids))
 	for k, id := range ids {
 		stringIDs[k] = id.String()
@@ -1226,6 +1360,25 @@ func (p *IdentityPersister) GetIdentityConfidential(ctx context.Context, id uuid
 	return p.GetIdentity(ctx, id, identity.ExpandEverything)
 }
 
+func (p *IdentityPersister) FindIdentityByExternalID(ctx context.Context, externalID string, expand identity.Expandables) (res *identity.Identity, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindIdentityByExternalID",
+		trace.WithAttributes(
+			attribute.String("identity.external_id", externalID),
+			attribute.Stringer("network.id", p.NetworkID(ctx))))
+	defer otelx.End(span, &err)
+
+	var i identity.Identity
+	if err := p.GetConnection(ctx).Where("external_id = ? AND nid = ?", externalID, p.NetworkID(ctx)).First(&i); err != nil {
+		return nil, sqlcon.HandleError(err)
+	}
+
+	if err := p.HydrateIdentityAssociations(ctx, &i, identity.ExpandEverything); err != nil {
+		return nil, err
+	}
+
+	return &i, nil
+}
+
 func (p *IdentityPersister) FindVerifiableAddressByValue(ctx context.Context, via string, value string) (_ *identity.VerifiableAddress, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindVerifiableAddressByValue",
 		trace.WithAttributes(
@@ -1252,6 +1405,47 @@ func (p *IdentityPersister) FindRecoveryAddressByValue(ctx context.Context, via 
 	}
 
 	return &address, nil
+}
+
+// Find all recovery addresses for an identity if at least one of its recovery addresses matches the provided value.
+func (p *IdentityPersister) FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) (_ []identity.RecoveryAddress, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue",
+		trace.WithAttributes(
+			attribute.Stringer("network.id", p.NetworkID(ctx))))
+	defer otelx.End(span, &err)
+
+	var recoveryAddresses []identity.RecoveryAddress
+
+	// SQL explanation:
+	// 1. Find a row (`B`) with the value matching `anyRecoveryAddress`.
+	//    This row has an identity id (`B.identity_id`).
+	// 2. Find all rows (`A`) with this identity id.
+	//    Meaning: find all recovery addresses for this identity.
+	//    The result set includes the user provided address (`anyRecoveryAddress`).
+	//    NOTE: Should we exclude from the result set the login address for more security?
+	//
+	// This is all done in one query with a self-join.
+	// We also bound the results for safety.
+	err = p.GetConnection(ctx).RawQuery(
+		`
+SELECT A.id, A.via, A.value, A.identity_id, A.created_at, A.updated_at, A.nid
+FROM identity_recovery_addresses A
+JOIN identity_recovery_addresses B
+ON A.identity_id = B.identity_id
+AND A.nid = B.nid
+WHERE B.value = ?
+AND A.nid = ?
+LIMIT 10
+		`,
+		stringToLowerTrim(anyRecoveryAddress),
+		p.NetworkID(ctx),
+	).
+		All(&recoveryAddresses)
+
+	if err != nil {
+		return nil, sqlcon.HandleError(err)
+	}
+	return recoveryAddresses, nil
 }
 
 func (p *IdentityPersister) VerifyAddress(ctx context.Context, code string) (err error) {
@@ -1289,16 +1483,17 @@ func (p *IdentityPersister) VerifyAddress(ctx context.Context, code string) (err
 	return nil
 }
 
-func (p *IdentityPersister) UpdateVerifiableAddress(ctx context.Context, address *identity.VerifiableAddress) (err error) {
+func (p *IdentityPersister) UpdateVerifiableAddress(ctx context.Context, address *identity.VerifiableAddress, updateColumns ...string) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateVerifiableAddress",
 		trace.WithAttributes(
 			attribute.Stringer("identity.id", address.IdentityID),
-			attribute.Stringer("network.id", p.NetworkID(ctx))))
+			attribute.Stringer("network.id", p.NetworkID(ctx)),
+			attribute.StringSlice("columns", updateColumns)))
 	defer otelx.End(span, &err)
 
 	address.NID = p.NetworkID(ctx)
 	address.Value = stringToLowerTrim(address.Value)
-	return update.Generic(ctx, p.GetConnection(ctx), p.r.Tracer(ctx).Tracer(), address)
+	return update.Generic(ctx, p.GetConnection(ctx), p.r.Tracer(ctx).Tracer(), address, updateColumns...)
 }
 
 func (p *IdentityPersister) validateIdentity(ctx context.Context, i *identity.Identity) (err error) {
@@ -1329,9 +1524,70 @@ func (p *IdentityPersister) InjectTraitsSchemaURL(ctx context.Context, i *identi
 	}
 	s, err := ss.GetByID(i.SchemaID)
 	if err != nil {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf(
+		return errors.WithStack(herodot.ErrMisconfiguration.WithReasonf(
 			`The JSON Schema "%s" for this identity's traits could not be found.`, i.SchemaID))
 	}
 	i.SchemaURL = s.SchemaURL(p.r.Config().SelfPublicURL(ctx)).String()
+	return nil
+}
+
+var (
+	credentialTypesID   = x.NewSyncMap[uuid.UUID, identity.CredentialsType]()
+	credentialTypesName = x.NewSyncMap[identity.CredentialsType, uuid.UUID]()
+)
+
+func FindIdentityCredentialsTypeByID(con *pop.Connection, id uuid.UUID) (identity.CredentialsType, error) {
+	result, found := credentialTypesID.Load(id)
+	if !found {
+		if err := loadCredentialTypes(con); err != nil {
+			return "", err
+		}
+
+		result, found = credentialTypesID.Load(id)
+	}
+
+	if !found {
+		return "", errors.WithStack(herodot.ErrInternalServerError.WithReasonf("The SQL adapter failed to return the appropriate credentials_type for id %q. This is a bug in the code.", id))
+	}
+
+	return result, nil
+}
+
+func FindIdentityCredentialsTypeByName(con *pop.Connection, ct identity.CredentialsType) (uuid.UUID, error) {
+	result, found := credentialTypesName.Load(ct)
+	if !found {
+		if err := loadCredentialTypes(con); err != nil {
+			return uuid.Nil, err
+		}
+
+		result, found = credentialTypesName.Load(ct)
+	}
+
+	if !found {
+		return uuid.Nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("The SQL adapter failed to return the appropriate credentials_type for name %q. This is a bug in the code.", ct))
+	}
+
+	return result, nil
+}
+
+var mux sync.Mutex
+
+func loadCredentialTypes(con *pop.Connection) (err error) {
+	ctx, span := trace.SpanFromContext(con.Context()).TracerProvider().Tracer("").Start(con.Context(), "persistence.sql.identity.loadCredentialTypes")
+	defer otelx.End(span, &err)
+	_ = ctx
+
+	mux.Lock()
+	defer mux.Unlock()
+	var tt []identity.CredentialsTypeTable
+	if err := con.WithContext(ctx).All(&tt); err != nil {
+		return sqlcon.HandleError(err)
+	}
+
+	for _, t := range tt {
+		credentialTypesID.Store(t.ID, t.Name)
+		credentialTypesName.Store(t.Name, t.ID)
+	}
+
 	return nil
 }

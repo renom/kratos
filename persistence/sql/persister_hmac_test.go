@@ -5,26 +5,20 @@ package sql
 
 import (
 	"context"
-	"os"
 	"testing"
 
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	"github.com/ory/x/configx"
-
-	"github.com/ory/x/contextx"
-
-	"github.com/ory/x/otelx"
-
-	"github.com/gobuffalo/pop/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/x/logrusx"
-
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/embedx"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/schema"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
 )
 
 type logRegistryOnly struct {
@@ -37,7 +31,7 @@ func (l *logRegistryOnly) Config() *config.Config {
 }
 
 func (l *logRegistryOnly) Contextualizer() contextx.Contextualizer {
-	//TODO implement me
+	// TODO implement me
 	panic("implement me")
 }
 
@@ -55,6 +49,7 @@ func (l *logRegistryOnly) Audit() *logrusx.Logger {
 func (l *logRegistryOnly) Tracer(context.Context) *otelx.Tracer {
 	return otelx.NewNoop(l.l, new(otelx.Config))
 }
+
 func (l *logRegistryOnly) IdentityTraitsSchemas(context.Context) (schema.IdentitySchemaList, error) {
 	panic("implement me")
 }
@@ -72,10 +67,10 @@ func TestPersisterHMAC(t *testing.T) {
 	baseSecret := "foobarbaz"
 	baseSecretBytes := []byte(baseSecret)
 	opts := []configx.OptionModifier{configx.SkipValidation(), configx.WithValue(config.ViperKeySecretsDefault, []string{baseSecret})}
-	conf := config.MustNew(t, logrusx.New("", ""), os.Stderr, &confighelpers.TestConfigProvider{Contextualizer: &contextx.Default{}, Options: opts}, opts...)
+	conf := config.MustNew(t, logrusx.New("", ""), contextx.NewTestConfigProvider(embedx.ConfigSchema, opts...), opts...)
 	c, err := pop.NewConnection(&pop.ConnectionDetails{URL: "sqlite://foo?mode=memory"})
 	require.NoError(t, err)
-	p, err := NewPersister(ctx, &logRegistryOnly{c: conf}, c)
+	p, err := NewPersister(&logRegistryOnly{c: conf}, c)
 	require.NoError(t, err)
 
 	t.Run("case=behaves deterministically", func(t *testing.T) {
@@ -88,13 +83,13 @@ func TestPersisterHMAC(t *testing.T) {
 	newSecret := "not" + baseSecret
 
 	t.Run("case=with only new sectet", func(t *testing.T) {
-		ctx = confighelpers.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{newSecret})
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{newSecret})
 		assert.NotEqual(t, hmacValueWithSecret(ctx, "hashme", baseSecretBytes), p.hmacValue(ctx, "hashme"))
 		assert.Equal(t, hmacValueWithSecret(ctx, "hashme", []byte(newSecret)), p.hmacValue(ctx, "hashme"))
 	})
 
 	t.Run("case=with new and old secret", func(t *testing.T) {
-		ctx = confighelpers.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{newSecret, baseSecret})
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{newSecret, baseSecret})
 		assert.Equal(t, hmacValueWithSecret(ctx, "hashme", []byte(newSecret)), p.hmacValue(ctx, "hashme"))
 		assert.NotEqual(t, hash, p.hmacValue(ctx, "hashme"))
 	})

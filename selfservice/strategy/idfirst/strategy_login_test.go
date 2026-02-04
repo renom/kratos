@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,33 +16,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/selfservice/strategy/oidc"
-
-	"github.com/ory/kratos/selfservice/strategy/idfirst"
-
-	configtesthelpers "github.com/ory/kratos/driver/config/testhelpers"
-
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
-	"github.com/tidwall/gjson"
-
-	kratos "github.com/ory/kratos/internal/httpclient"
-	"github.com/ory/kratos/text"
-	"github.com/ory/kratos/x"
-	"github.com/ory/x/assertx"
-	"github.com/ory/x/ioutilx"
-	"github.com/ory/x/urlx"
-
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
+	"github.com/ory/kratos/selfservice/strategy/idfirst"
+	"github.com/ory/kratos/selfservice/strategy/oidc"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
+	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/ioutilx"
 	"github.com/ory/x/snapshotx"
+	"github.com/ory/x/urlx"
 )
 
 //go:embed stub/default.schema.json
@@ -53,30 +50,30 @@ func TestCompleteLogin(t *testing.T) {
 
 	// We enable the password method to test the identifier first strategy
 
-	// ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword), map[string]interface{}{"enabled": true})
+	// ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword), map[string]interface{}{"enabled": true})
 	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword), map[string]interface{}{"enabled": true})
 
-	// ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+	// ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
 	conf.MustSet(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
 
-	router := x.NewRouterPublic()
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(reg)
+	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin(reg))
 
 	errTS := testhelpers.NewErrorTestServer(t, reg)
 	uiTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
 	redirTS := testhelpers.NewRedirSessionEchoTS(t, reg)
 
 	// Overwrite these two:
-	// ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceErrorUI, errTS.URL+"/error-ts")
+	// ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceErrorUI, errTS.URL+"/error-ts")
 	conf.MustSet(ctx, config.ViperKeySelfServiceErrorUI, errTS.URL+"/error-ts")
 
-	// ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceLoginUI, uiTS.URL+"/login-ts")
+	// ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceLoginUI, uiTS.URL+"/login-ts")
 	conf.MustSet(ctx, config.ViperKeySelfServiceLoginUI, uiTS.URL+"/login-ts")
 
 	// ctx = testhelpers.WithDefaultIdentitySchemaFromRaw(ctx, loginSchema)
 	testhelpers.SetDefaultIdentitySchemaFromRaw(conf, loginSchema)
 
-	// ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
+	// ctx = contextx.WithConfigValue(ctx, config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
 	conf.MustSet(ctx, config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
 
 	//ensureFieldsExist := func(t *testing.T, body []byte) {
@@ -131,7 +128,7 @@ func TestCompleteLogin(t *testing.T) {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
 
-		actual, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, req)
+		actual, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router, req)
 		assert.Contains(t, res.Request.URL.String(), publicTS.URL+login.RouteSubmitFlow)
 		assert.Equal(t, text.NewErrorValidationLoginNoStrategyFound().Text, gjson.GetBytes(actual, "ui.messages.0.text").String())
 	})
@@ -180,7 +177,7 @@ func TestCompleteLogin(t *testing.T) {
 		})
 
 		values := url.Values{
-			"csrf_token": {x.FakeCSRFToken},
+			"csrf_token": {nosurfx.FakeCSRFToken},
 			"identifier": {"identifier"},
 			"method":     {"identifier_first"},
 		}
@@ -236,7 +233,7 @@ func TestCompleteLogin(t *testing.T) {
 
 			actual, res := testhelpers.LoginMakeRequest(t, false, false, f, browserClient, values.Encode())
 			assert.EqualValues(t, http.StatusOK, res.StatusCode)
-			assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken,
+			assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken,
 				json.RawMessage(actual), "%s", actual)
 		})
 
@@ -246,7 +243,7 @@ func TestCompleteLogin(t *testing.T) {
 
 			actual, res := testhelpers.LoginMakeRequest(t, false, true, f, browserClient, values.Encode())
 			assert.EqualValues(t, http.StatusForbidden, res.StatusCode)
-			assertx.EqualAsJSON(t, x.ErrInvalidCSRFToken,
+			assertx.EqualAsJSON(t, nosurfx.ErrInvalidCSRFToken,
 				json.RawMessage(gjson.Get(actual, "error").Raw), "%s", actual)
 		})
 
@@ -284,7 +281,7 @@ func TestCompleteLogin(t *testing.T) {
 
 					res, err := apiClient.Do(req)
 					require.NoError(t, err)
-					defer res.Body.Close()
+					defer func() { _ = res.Body.Close() }()
 
 					actual := string(ioutilx.MustReadAll(res.Body))
 					assert.EqualValues(t, http.StatusBadRequest, res.StatusCode)
@@ -389,20 +386,17 @@ func TestCompleteLogin(t *testing.T) {
 			})
 
 			check := func(t *testing.T, body string) {
-				t.Logf("%s", body)
-
+				t.Logf("aaxx %s", body)
 				assert.NotEmpty(t, gjson.Get(body, "id").String(), "%s", body)
 				assert.Contains(t, gjson.Get(body, "ui.action").String(), publicTS.URL+login.RouteSubmitFlow, "%s", body)
 				assert.Contains(t, body, text.NewErrorValidationAccountNotFound().Text, "we do expect to see an error that the account does not exist: %s", body)
 
 				assert.Equal(t, "text", gjson.Get(body, "ui.nodes.#(attributes.name==identifier).attributes.type").String(), "identifier is not hidden and we can see the input field as well")
+				assert.Equal(t, "google", gjson.Get(body, "ui.nodes.#(attributes.name==provider).attributes.value").String(), "google oidc button is not hidden")
 
 				assert.NotContains(t, body, fmt.Sprintf("%d", text.InfoSelfServiceLoginPasskey), "we do not expect to see a passkey trigger button: %s", body)
 				assert.NotContains(t, body, fmt.Sprintf("%d", text.InfoSelfServiceLoginWebAuthn), "we do not expect to see a webauthn trigger: %s", body)
 				assert.NotContains(t, body, fmt.Sprintf("%d", text.InfoSelfServiceLoginPassword), "we do not expect to see a password trigger: %s", body)
-
-				assert.NotContains(t, body, fmt.Sprintf("%d", text.InfoSelfServiceLoginWith), "we do not expect to see a oidc trigger: %s", body)
-				assert.NotContains(t, body, "google", "we do not expect to see a google trigger: %s", body)
 			}
 
 			values := func(v url.Values) {
@@ -494,9 +488,13 @@ func TestCompleteLogin(t *testing.T) {
 func TestFormHydration(t *testing.T) {
 	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyDefaultIdentitySchemaID, "default")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+		{ID: "default", URL: "base64://" + base64.URLEncoding.EncodeToString(loginSchema), SelfserviceSelectable: true},
+		{ID: "not-default", URL: "file://stub/doesnotexist.schema.json", SelfserviceSelectable: true},
+	})
 
-	ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/default.schema.json")
 	s, err := reg.AllLoginStrategies().Strategy(identity.CredentialsType(node.IdentifierFirstGroup))
 	require.NoError(t, err)
 	fh, ok := s.(login.FormHydrator)
@@ -509,14 +507,15 @@ func TestFormHydration(t *testing.T) {
 		snapshotx.SnapshotT(t, f.UI.Nodes)
 	}
 	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *login.Flow) {
-		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
-		r = r.WithContext(ctx)
 		t.Helper()
+		query := ""
+
+		r := httptest.NewRequest("GET", "/self-service/login/browser"+query, nil)
+		r = r.WithContext(ctx)
 		f, err := login.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
 		require.NoError(t, err)
 		return r, f
 	}
-
 	t.Run("method=PopulateLoginMethodSecondFactor", func(t *testing.T) {
 		r, f := newFlow(ctx, t)
 		f.RequestedAAL = identity.AuthenticatorAssuranceLevel2
@@ -532,7 +531,7 @@ func TestFormHydration(t *testing.T) {
 
 	t.Run("method=PopulateLoginMethodFirstFactorRefresh", func(t *testing.T) {
 		r, f := newFlow(ctx, t)
-		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+		require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 		toSnapshot(t, f)
 	})
 
@@ -557,7 +556,7 @@ func TestFormHydration(t *testing.T) {
 
 		t.Run("case=WithIdentityHint", func(t *testing.T) {
 			t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
-				ctx := configtesthelpers.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, true)
+				ctx := contextx.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, true)
 
 				id := identity.NewIdentity("default")
 				r, f := newFlow(ctx, t)
@@ -566,7 +565,7 @@ func TestFormHydration(t *testing.T) {
 			})
 
 			t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
-				ctx := configtesthelpers.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, false)
+				ctx := contextx.WithConfigValue(ctx, config.ViperKeySecurityAccountEnumerationMitigate, false)
 
 				t.Run("case=identity has password", func(t *testing.T) {
 					id := identity.NewIdentity("default")

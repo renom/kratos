@@ -23,15 +23,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/ory/kratos/driver"
-	"github.com/ory/x/dbal"
 	"github.com/ory/x/jsonnetsecure"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/x/tlsx"
 
-	"github.com/avast/retry-go/v3"
 	"github.com/phayes/freeport"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -42,13 +42,7 @@ import (
 	"github.com/ory/x/configx"
 )
 
-type ConfigOptions map[string]interface{}
-
-func init() {
-	dbal.RegisterDriver(func() dbal.Driver {
-		return driver.NewRegistryDefault()
-	})
-}
+type ConfigOptions = map[string]interface{}
 
 func StartE2EServerOnly(t *testing.T, configFile string, isTLS bool, configOptions ConfigOptions) (publicPort, adminPort int) {
 	return startE2EServerOnly(t, configFile, isTLS, configOptions, 0)
@@ -69,33 +63,29 @@ func startE2EServerOnly(t *testing.T, configFile string, isTLS bool, configOptio
 		adminUrl = fmt.Sprintf("https://127.0.0.1:%d", adminPort)
 	}
 
-	dbt, err := os.MkdirTemp(os.TempDir(), "ory-kratos-e2e-examples-*")
-	require.NoError(t, err)
-	dsn := "sqlite://" + filepath.Join(dbt, "db.sqlite") + "?_fk=true&mode=rwc"
+	dsn := "sqlite://" + filepath.Join(t.TempDir(), "db.sqlite") + "?_fk=true&mode=rwc"
 
-	ctx := configx.ContextWithConfigOptions(
-		context.Background(),
-		configx.WithValue("dsn", dsn),
-		configx.WithValue("dev", true),
-		configx.WithValue("log.level", "error"),
-		configx.WithValue("log.leak_sensitive_values", true),
-		configx.WithValue("serve.public.port", publicPort),
-		configx.WithValue("serve.admin.port", adminPort),
-		configx.WithValue("serve.public.base_url", publicUrl),
-		configx.WithValue("serve.admin.base_url", adminUrl),
-		configx.WithValues(configOptions),
-	)
+	ctx := t.Context()
+	defaultConfig := map[string]any{
+		"dsn":                       dsn,
+		"dev":                       true,
+		"log.level":                 "error",
+		"log.leak_sensitive_values": true,
+		"serve.public.port":         publicPort,
+		"serve.admin.port":          adminPort,
+		"serve.public.base_url":     publicUrl,
+		"serve.admin.base_url":      adminUrl,
+	}
 
 	jsonnetPool := jsonnetsecure.NewProcessPool(runtime.GOMAXPROCS(0))
 	t.Cleanup(jsonnetPool.Close)
 
 	//nolint:staticcheck
 	//lint:ignore SA1029 we really want this
-	ctx = context.WithValue(ctx, "dsn", dsn)
 	ctx, cancel := context.WithCancel(ctx)
 	executor := &cmdx.CommandExecuter{
 		New: func() *cobra.Command {
-			return cmd.NewRootCmd(driver.WithJsonnetPool(jsonnetPool))
+			return cmd.NewRootCmd(driver.WithJsonnetPool(jsonnetPool), driver.WithConfigOptions(configx.WithValues(defaultConfig), configx.WithValues(configOptions)))
 		},
 		Ctx: ctx,
 	}
@@ -106,7 +96,7 @@ func startE2EServerOnly(t *testing.T, configFile string, isTLS bool, configOptio
 
 	t.Log("Starting server...")
 	stdOut, stdErr := &bytes.Buffer{}, &bytes.Buffer{}
-	eg := executor.ExecBackground(nil, stdErr, stdOut, "serve", "--config", configFile, "--watch-courier")
+	eg := executor.ExecBackground(nil, io.MultiWriter(os.Stdout, stdOut), io.MultiWriter(os.Stdout, stdErr), "serve", "--config", configFile, "--watch-courier")
 
 	err = waitTimeout(t, eg, time.Second)
 	if err != nil && tries < 5 {
@@ -152,7 +142,7 @@ func CheckE2EServerOnHTTP(t *testing.T, publicPort, adminPort int) (publicUrl, a
 }
 
 func waitToComeAlive(t *testing.T, publicUrl, adminUrl string) {
-	require.NoError(t, retry.Do(func() error {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		//#nosec G402 -- TLS InsecureSkipVerify set true
 		tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 		client := &http.Client{Transport: tr}
@@ -164,25 +154,14 @@ func waitToComeAlive(t *testing.T, publicUrl, adminUrl string) {
 			adminUrl + "/health/alive",
 		} {
 			res, err := client.Get(url)
-			if err != nil {
-				return err
-			}
+			require.NoError(t, err)
 
 			body := x.MustReadAll(res.Body)
-			if err := res.Body.Close(); err != nil {
-				return err
-			}
-			t.Logf("%s", body)
+			_ = res.Body.Close()
 
-			if res.StatusCode != http.StatusOK {
-				return fmt.Errorf("expected status code 200 but got: %d", res.StatusCode)
-			}
+			require.Equalf(t, http.StatusOK, res.StatusCode, "%s", body)
 		}
-		return nil
-	},
-		retry.MaxDelay(time.Second),
-		retry.Attempts(60)),
-	)
+	}, 10*time.Second, time.Second)
 }
 
 func CheckE2EServerOnHTTPS(t *testing.T, publicPort, adminPort int) (publicUrl, adminUrl string) {

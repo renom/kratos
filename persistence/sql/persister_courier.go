@@ -8,19 +8,17 @@ import (
 	"database/sql"
 	"encoding/json"
 
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
-	"github.com/ory/x/otelx"
-	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/sqlcon"
-	"github.com/ory/x/uuidx"
-
 	"github.com/ory/kratos/courier"
 	"github.com/ory/kratos/persistence/sql/update"
-	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/otelx"
+	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/uuidx"
 )
 
 var _ courier.Persister = new(Persister)
@@ -34,7 +32,7 @@ func (p *Persister) AddMessage(ctx context.Context, m *courier.Message) (err err
 	return sqlcon.HandleError(p.GetConnection(ctx).Create(m)) // do not create eager to avoid identity injection.
 }
 
-func (p *Persister) ListMessages(ctx context.Context, filter courier.ListCourierMessagesParameters, opts []keysetpagination.Option) (_ []courier.Message, _ int64, _ *keysetpagination.Paginator, err error) {
+func (p *Persister) ListMessages(ctx context.Context, filter courier.ListCourierMessagesParameters, opts []keysetpagination.Option) (_ []courier.Message, _ *keysetpagination.Paginator, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.ListMessages")
 	defer otelx.End(span, &err)
 
@@ -48,28 +46,19 @@ func (p *Persister) ListMessages(ctx context.Context, filter courier.ListCourier
 		q = q.Where("recipient=?", filter.Recipient)
 	}
 
-	count, err := q.Count(&courier.Message{})
-	if err != nil {
-		return nil, 0, nil, sqlcon.HandleError(err)
-	}
-
-	opts = append(opts, keysetpagination.WithDefaultToken(new(courier.Message).DefaultPageToken()))
+	opts = append(opts, keysetpagination.WithDefaultToken(courier.Message{}.DefaultPageToken()))
 	opts = append(opts, keysetpagination.WithDefaultSize(10))
-	opts = append(opts, keysetpagination.WithColumn("created_at", "DESC"))
-	paginator := keysetpagination.GetPaginator(opts...)
-
-	if _, err := uuid.FromString(paginator.Token().Parse("id")["id"]); err != nil {
-		return nil, 0, nil, errors.WithStack(x.PageTokenInvalid)
-	}
+	paginator := keysetpagination.NewPaginator(opts...)
 
 	messages := make([]courier.Message, paginator.Size())
 	if err := q.Scope(keysetpagination.Paginate[courier.Message](paginator)).
 		All(&messages); err != nil {
-		return nil, 0, nil, sqlcon.HandleError(err)
+		return nil, nil, sqlcon.HandleError(err)
 	}
 
 	messages, nextPage := keysetpagination.Result(messages, paginator)
-	return messages, int64(count), nextPage, nil
+
+	return messages, nextPage, nil
 }
 
 func (p *Persister) NextMessages(ctx context.Context, limit uint8) (messages []courier.Message, err error) {
@@ -160,7 +149,7 @@ func (p *Persister) SetMessageStatus(ctx context.Context, id uuid.UUID, ms couri
 }
 
 func (p *Persister) IncrementMessageSendCount(ctx context.Context, id uuid.UUID) (err error) {
-	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.SetMessageStatus")
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.IncrementMessageSendCount")
 	defer otelx.End(span, &err)
 
 	count, err := p.GetConnection(ctx).RawQuery(

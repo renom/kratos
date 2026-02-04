@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/strategy/passkey"
 
@@ -71,10 +73,10 @@ func TestCompleteSettings(t *testing.T) {
 		f := testhelpers.InitializeSettingsFlowViaBrowser(t, apiClient, true, fix.publicTS)
 
 		testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
-			"4.attributes.value", // passkey_settings_register
-			"5.attributes.value", // CSRF
-			"6.attributes.nonce", // script
-			"6.attributes.src",   // script
+			"0.attributes.value", // CSRF
+			"1.attributes.nonce", // script
+			"1.attributes.src",   // script
+			"6.attributes.value", // passkey_settings_register
 		})
 	})
 
@@ -86,10 +88,10 @@ func TestCompleteSettings(t *testing.T) {
 		f := testhelpers.InitializeSettingsFlowViaBrowser(t, apiClient, true, fix.publicTS)
 
 		testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
-			"2.attributes.value", // passkey_create_data
-			"3.attributes.value", // CSRF
-			"4.attributes.nonce", // script
-			"4.attributes.src",   // script
+			"0.attributes.value", // CSRF
+			"1.attributes.nonce", // script
+			"1.attributes.src",   // script
+			"4.attributes.value", // passkey_create_data
 		})
 	})
 
@@ -142,10 +144,10 @@ func TestCompleteSettings(t *testing.T) {
 			}, id)
 			if spa {
 				assert.Contains(t, res.Request.URL.String(), fix.publicTS.URL+settings.RouteSubmitFlow)
-				assert.Equal(t, x.ErrInvalidCSRFToken.Reason(), gjson.Get(body, "error.reason").String(), body)
+				assert.Equal(t, nosurfx.ErrInvalidCSRFToken.Reason(), gjson.Get(body, "error.reason").String(), body)
 			} else {
 				assert.Contains(t, res.Request.URL.String(), fix.errTS.URL)
-				assert.Equal(t, x.ErrInvalidCSRFToken.Reason(), gjson.Get(body, "reason").String(), body)
+				assert.Equal(t, nosurfx.ErrInvalidCSRFToken.Reason(), gjson.Get(body, "reason").String(), body)
 			}
 		}
 
@@ -439,7 +441,7 @@ func TestCompleteSettings(t *testing.T) {
 				require.NoError(t, err)
 
 				actual := x.MustReadAll(res.Body)
-				defer res.Body.Close()
+				defer func() { _ = res.Body.Close() }()
 
 				assert.Equal(t, text.NewErrorValidationIdentifierMissing().Text, gjson.GetBytes(actual, "ui.messages.0.text").String(), "%s", actual)
 			})

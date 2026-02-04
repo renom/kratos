@@ -81,8 +81,8 @@ func newRegistrationFixture(t *testing.T) *fixture {
 	fix.conf = fix.reg.Config()
 	ctx := fix.ctx
 
-	router := x.NewRouterPublic()
-	fix.publicTS, _ = testhelpers.NewKratosServerWithRouters(t, fix.reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(fix.reg)
+	fix.publicTS, _ = testhelpers.NewKratosServerWithRouters(t, fix.reg, router, x.NewRouterAdmin(fix.reg))
 
 	_ = testhelpers.NewErrorTestServer(t, fix.reg)
 	_ = testhelpers.NewRegistrationUIFlowEchoServer(t, fix.reg)
@@ -110,8 +110,8 @@ func newLoginFixture(t *testing.T) *fixture {
 		config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled",
 		false)
 
-	router := x.NewRouterPublic()
-	fix.publicTS, _ = testhelpers.NewKratosServerWithRouters(t, fix.reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(fix.reg)
+	fix.publicTS, _ = testhelpers.NewKratosServerWithRouters(t, fix.reg, router, x.NewRouterAdmin(fix.reg))
 
 	fix.errTS = testhelpers.NewErrorTestServer(t, fix.reg)
 	fix.uiTS = testhelpers.NewLoginUIFlowEchoServer(t, fix.reg)
@@ -151,14 +151,6 @@ func (fix *fixture) checkURL(t *testing.T, shouldRedirect bool, res *http.Respon
 	} else {
 		assert.Contains(t, res.Request.URL.String(), fix.publicTS.URL+login.RouteSubmitFlow)
 	}
-}
-
-func (fix *fixture) loginViaAPI(t *testing.T, v func(url.Values), apiClient *http.Client, opts ...testhelpers.InitFlowWithOption) (string, *http.Response) {
-	f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false, opts...)
-	values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
-	v(values)
-	payload := testhelpers.EncodeFormAsJSON(t, true, values)
-	return testhelpers.LoginMakeRequest(t, true, false, f, apiClient, payload)
 }
 
 func (fix *fixture) loginViaBrowser(t *testing.T, spa bool, cb func(url.Values), browserClient *http.Client, opts ...testhelpers.InitFlowWithOption) (string, *http.Response) {
@@ -228,6 +220,7 @@ func (fix *fixture) disableSessionAfterRegistration() {
 		identity.CredentialsTypePasskey.String(),
 	), nil)
 }
+
 func (fix *fixture) enableSessionAfterRegistration() {
 	fix.conf.MustSet(fix.ctx, config.HookStrategyKey(
 		config.ViperKeySelfServiceRegistrationAfter,
@@ -239,12 +232,6 @@ type submitPasskeyOpt struct {
 	initFlowOpts    []testhelpers.InitFlowWithOption
 	userID          string
 	internalContext sqlxx.JSONRawMessage
-}
-
-func newSubmitPasskeyOpt() *submitPasskeyOpt {
-	return &submitPasskeyOpt{
-		internalContext: registrationFixtureSuccessInternalContext,
-	}
 }
 
 type submitPasskeyOption func(o *submitPasskeyOpt)
@@ -261,6 +248,35 @@ func withInternalContext(ic sqlxx.JSONRawMessage) submitPasskeyOption {
 	}
 }
 
+func withInitFlowWithOption(ifo []testhelpers.InitFlowWithOption) submitPasskeyOption {
+	return func(o *submitPasskeyOpt) {
+		o.initFlowOpts = ifo
+	}
+}
+
+func (fix *fixture) submitPasskeyBrowserRegistration(
+	t *testing.T,
+	flowType string,
+	client *http.Client,
+	cb func(values url.Values),
+	opts ...submitPasskeyOption,
+) (string, *http.Response, *kratos.RegistrationFlow) {
+	return fix.submitPasskeyRegistration(t, flowType, client, cb, append([]submitPasskeyOption{withInternalContext(registrationFixtureSuccessBrowserInternalContext)}, opts...)...)
+}
+
+func (fix *fixture) submitPasskeyAndroidRegistration(
+	t *testing.T,
+	flowType string,
+	client *http.Client,
+	cb func(values url.Values),
+	opts ...submitPasskeyOption,
+) (string, *http.Response, *kratos.RegistrationFlow) {
+	return fix.submitPasskeyRegistration(t, flowType, client, cb,
+		append([]submitPasskeyOption{withInternalContext(
+			registrationFixtureSuccessAndroidInternalContext,
+		)}, opts...)...)
+}
+
 func (fix *fixture) submitPasskeyRegistration(
 	t *testing.T,
 	flowType string,
@@ -268,7 +284,7 @@ func (fix *fixture) submitPasskeyRegistration(
 	cb func(values url.Values),
 	opts ...submitPasskeyOption,
 ) (string, *http.Response, *kratos.RegistrationFlow) {
-	o := newSubmitPasskeyOpt()
+	o := &submitPasskeyOpt{}
 	for _, fn := range opts {
 		fn(o)
 	}
@@ -282,7 +298,7 @@ func (fix *fixture) submitPasskeyRegistration(
 	passkeyRegisterVal := values.Get(node.PasskeyRegister) // needed in the second step
 	values.Del(node.PasskeyRegister)
 	values.Set("method", "passkey")
-	body, _ := testhelpers.RegistrationMakeRequest(t, false, isSPA, regFlow, client, values.Encode())
+	_, _ = testhelpers.RegistrationMakeRequest(t, false, isSPA, regFlow, client, values.Encode())
 
 	// We inject the session to replay
 	interim, err := fix.reg.RegistrationFlowPersister().GetRegistrationFlow(fix.ctx, uuid.FromStringOrNil(regFlow.Id))
@@ -302,7 +318,7 @@ func (fix *fixture) submitPasskeyRegistration(
 }
 
 func (fix *fixture) makeRegistration(t *testing.T, flowType string, values func(v url.Values), opts ...submitPasskeyOption) (actual string, res *http.Response, fetchedFlow *registration.Flow) {
-	actual, res, actualFlow := fix.submitPasskeyRegistration(t, flowType, testhelpers.NewClientWithCookies(t), values, opts...)
+	actual, res, actualFlow := fix.submitPasskeyBrowserRegistration(t, flowType, testhelpers.NewClientWithCookies(t), values, opts...)
 	fetchedFlow, err := fix.reg.RegistrationFlowPersister().GetRegistrationFlow(fix.ctx, uuid.FromStringOrNil(actualFlow.Id))
 	require.NoError(t, err)
 
@@ -316,6 +332,11 @@ func (fix *fixture) makeSuccessfulRegistration(t *testing.T, flowType string, ex
 	}
 	assert.Contains(t, res.Request.URL.String(), expectReturnTo, "%+v\n\t%s", res.Request, assertx.PrettifyJSONPayload(t, actual))
 	return actual
+}
+
+func (fix *fixture) makeUnsuccessfulRegistration(t *testing.T, flowType string, expectReturnTo string, values func(v url.Values), opts ...submitPasskeyOption) (actual string, res *http.Response) {
+	actual, res, _ = fix.makeRegistration(t, flowType, values, opts...)
+	return actual, res
 }
 
 func (fix *fixture) createIdentityWithoutPasskey(t *testing.T) *identity.Identity {

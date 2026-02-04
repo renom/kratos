@@ -15,33 +15,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/kratos/selfservice/strategy/idfirst"
-
-	"github.com/ory/x/jsonx"
-
 	"github.com/go-webauthn/webauthn/protocol"
-
-	kratos "github.com/ory/kratos/internal/httpclient"
-	"github.com/ory/kratos/text"
-	"github.com/ory/x/snapshotx"
-
-	"github.com/ory/kratos/selfservice/flow"
-	"github.com/ory/kratos/selfservice/strategy/webauthn"
-
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/kratos/driver/config"
-	configtesthelpers "github.com/ory/kratos/driver/config/testhelpers"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
+	"github.com/ory/kratos/selfservice/strategy/idfirst"
+	"github.com/ory/kratos/selfservice/strategy/webauthn"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/jsonx"
+	"github.com/ory/x/snapshotx"
 )
 
 var (
@@ -82,8 +77,8 @@ func TestCompleteLogin(t *testing.T) {
 	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled", false)
 	enableWebAuthn(conf)
 
-	router := x.NewRouterPublic()
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(reg)
+	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin(reg))
 
 	errTS := testhelpers.NewErrorTestServer(t, reg)
 	uiTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
@@ -407,7 +402,7 @@ func TestCompleteLogin(t *testing.T) {
 					res, err := browserClient.Get(redir)
 					require.NoError(t, err)
 
-					defer res.Body.Close()
+					defer func() { _ = res.Body.Close() }()
 					raw, err := io.ReadAll(res.Body)
 					require.NoError(t, err)
 					body = string(raw)
@@ -416,7 +411,7 @@ func TestCompleteLogin(t *testing.T) {
 				}
 
 				assert.NotEmpty(t, gjson.Get(body, "id").String(), "%s", body)
-				snapshotx.SnapshotTExceptMatchingKeys(t, json.RawMessage(body), []string{"value", "src", "nonce", "action", "request_url", "issued_at", "expires_at", "created_at", "updated_at", "id", "onclick"})
+				snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptNestedKeys("value", "src", "nonce", "action", "request_url", "issued_at", "expires_at", "created_at", "updated_at", "id", "onclick"))
 				assert.Equal(t, text.NewInfoLoginWebAuthnPasswordless().Text, gjson.Get(body, "ui.messages.0.text").String(), "%s", body)
 
 				values.Set(node.WebAuthnLogin, string(loginFixtureSuccessResponseInvalid))
@@ -649,8 +644,8 @@ func TestFormHydration(t *testing.T) {
 	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 
-	ctx = configtesthelpers.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeWebAuthn)+".enabled", true)
-	ctx = configtesthelpers.WithConfigValue(
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeWebAuthn)+".enabled", true)
+	ctx = contextx.WithConfigValue(
 		ctx,
 		config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeWebAuthn)+".config",
 		map[string]interface{}{
@@ -677,8 +672,13 @@ func TestFormHydration(t *testing.T) {
 		snapshotx.SnapshotT(t, f.UI.Nodes, snapshotx.ExceptNestedKeys("onclick", "nonce", "src"))
 	}
 
-	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *login.Flow) {
-		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
+	newFlowInternal := func(ctx context.Context, t *testing.T, identitySchema string) (*http.Request, *login.Flow) {
+		query := ""
+		if identitySchema != "" {
+			query = "?identity_schema=" + identitySchema
+		}
+
+		r := httptest.NewRequest("GET", "/self-service/login/browser"+query, nil)
 		r = r.WithContext(ctx)
 		t.Helper()
 		f, err := login.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
@@ -686,9 +686,15 @@ func TestFormHydration(t *testing.T) {
 		require.NoError(t, err)
 		return r, f
 	}
+	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *login.Flow) {
+		return newFlowInternal(ctx, t, "")
+	}
+	newFlowWithIdentitySchema := func(ctx context.Context, t *testing.T, identitySchema string) (*http.Request, *login.Flow) {
+		return newFlowInternal(ctx, t, identitySchema)
+	}
 
-	passwordlessEnabled := configtesthelpers.WithConfigValue(ctx, config.ViperKeyWebAuthnPasswordless, true)
-	mfaEnabled := configtesthelpers.WithConfigValue(ctx, config.ViperKeyWebAuthnPasswordless, false)
+	passwordlessEnabled := contextx.WithConfigValue(ctx, config.ViperKeyWebAuthnPasswordless, true)
+	mfaEnabled := contextx.WithConfigValue(ctx, config.ViperKeyWebAuthnPasswordless, false)
 
 	t.Run("method=PopulateLoginMethodSecondFactor", func(t *testing.T) {
 		id := createIdentity(t, ctx, reg)
@@ -734,7 +740,7 @@ func TestFormHydration(t *testing.T) {
 			r, f := newFlow(passwordlessEnabled, t)
 			r.Header = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 			f.Refresh = true
-			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
 		})
 
@@ -743,7 +749,7 @@ func TestFormHydration(t *testing.T) {
 			r, f := newFlow(passwordlessEnabled, t)
 			r.Header = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 			f.Refresh = true
-			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
 		})
 
@@ -753,7 +759,7 @@ func TestFormHydration(t *testing.T) {
 			r.Header = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 			f.Refresh = true
 			f.RequestedAAL = identity.AuthenticatorAssuranceLevel2
-			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
 		})
 
@@ -763,7 +769,7 @@ func TestFormHydration(t *testing.T) {
 			r.Header = testhelpers.NewHTTPClientWithIdentitySessionToken(t, ctx, reg, id).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 			f.Refresh = true
 			f.RequestedAAL = identity.AuthenticatorAssuranceLevel2
-			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f))
+			require.NoError(t, fh.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
 		})
 	})
@@ -773,7 +779,7 @@ func TestFormHydration(t *testing.T) {
 			t.Run("case=passwordless enabled", func(t *testing.T) {
 				t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
+						contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f), idfirst.ErrNoCredentialsFound)
@@ -782,7 +788,7 @@ func TestFormHydration(t *testing.T) {
 
 				t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
+						contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f), idfirst.ErrNoCredentialsFound)
@@ -793,7 +799,7 @@ func TestFormHydration(t *testing.T) {
 			t.Run("case=mfa enabled", func(t *testing.T) {
 				t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
+						contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f), idfirst.ErrNoCredentialsFound)
@@ -802,7 +808,7 @@ func TestFormHydration(t *testing.T) {
 
 				t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
+						contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f), idfirst.ErrNoCredentialsFound)
@@ -815,7 +821,7 @@ func TestFormHydration(t *testing.T) {
 			t.Run("case=passwordless enabled", func(t *testing.T) {
 				t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
+						contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentifier("foo@bar.com")), idfirst.ErrNoCredentialsFound)
@@ -824,7 +830,7 @@ func TestFormHydration(t *testing.T) {
 
 				t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
+						contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentifier("foo@bar.com")), idfirst.ErrNoCredentialsFound)
@@ -835,7 +841,7 @@ func TestFormHydration(t *testing.T) {
 			t.Run("case=mfa enabled", func(t *testing.T) {
 				t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
+						contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentifier("foo@bar.com")), idfirst.ErrNoCredentialsFound)
@@ -844,7 +850,7 @@ func TestFormHydration(t *testing.T) {
 
 				t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
 					r, f := newFlow(
-						configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
+						contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true),
 						t,
 					)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentifier("foo@bar.com")), idfirst.ErrNoCredentialsFound)
@@ -855,8 +861,8 @@ func TestFormHydration(t *testing.T) {
 
 		t.Run("case=WithIdentityHint", func(t *testing.T) {
 			t.Run("case=account enumeration mitigation enabled", func(t *testing.T) {
-				mfaEnabled := configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true)
-				passwordlessEnabled := configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true)
+				mfaEnabled := contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true)
+				passwordlessEnabled := contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, true)
 
 				id := identity.NewIdentity("test-provider")
 				t.Run("case=passwordless enabled", func(t *testing.T) {
@@ -873,8 +879,8 @@ func TestFormHydration(t *testing.T) {
 			})
 
 			t.Run("case=account enumeration mitigation disabled", func(t *testing.T) {
-				mfaEnabled := configtesthelpers.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false)
-				passwordlessEnabled := configtesthelpers.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false)
+				mfaEnabled := contextx.WithConfigValue(mfaEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false)
+				passwordlessEnabled := contextx.WithConfigValue(passwordlessEnabled, config.ViperKeySecurityAccountEnumerationMitigate, false)
 
 				id, _ := createIdentityAndReturnIdentifier(t, ctx, reg, []byte(`{"credentials":[{"id":"Zm9vZm9v","display_name":"foo","is_passwordless":true}]}`))
 
@@ -921,6 +927,26 @@ func TestFormHydration(t *testing.T) {
 		t.Run("case=mfa enabled", func(t *testing.T) {
 			r, f := newFlow(mfaEnabled, t)
 			require.NoError(t, fh.PopulateLoginMethodIdentifierFirstIdentification(r, f))
+			toSnapshot(t, f)
+		})
+	})
+
+	t.Run("case=Multi-Schema-method=PopulateLoginMethodFirstFactor", func(t *testing.T) {
+		multiSchema := contextx.WithConfigValue(ctx, config.ViperKeyDefaultIdentitySchemaID, "default")
+		multiSchema = contextx.WithConfigValue(multiSchema, config.ViperKeyIdentitySchemas, config.Schemas{
+			{ID: "default", URL: "file://./stub/missing-identifier.schema.json"},
+			{ID: "not-default", URL: "file://./stub/login.schema.json", SelfserviceSelectable: true},
+		})
+
+		t.Run("case=passwordless enabled", func(t *testing.T) {
+			r, f := newFlowWithIdentitySchema(contextx.WithConfigValue(multiSchema, config.ViperKeyWebAuthnPasswordless, true), t, "not-default")
+			require.NoError(t, fh.PopulateLoginMethodFirstFactor(r, f))
+			toSnapshot(t, f)
+		})
+
+		t.Run("case=mfa enabled", func(t *testing.T) {
+			r, f := newFlowWithIdentitySchema(contextx.WithConfigValue(multiSchema, config.ViperKeyWebAuthnPasswordless, false), t, "not-default")
+			require.NoError(t, fh.PopulateLoginMethodFirstFactor(r, f))
 			toSnapshot(t, f)
 		})
 	})

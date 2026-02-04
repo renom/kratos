@@ -5,14 +5,13 @@ package oidc
 
 import (
 	"encoding/json"
+	"maps"
 	"net/url"
 	"strings"
 
 	"github.com/pkg/errors"
-	"golang.org/x/exp/maps"
 
 	"github.com/ory/herodot"
-
 	"github.com/ory/x/urlx"
 )
 
@@ -40,6 +39,7 @@ type Configuration struct {
 	// - dingtalk
 	// - linkedin
 	// - patreon
+	// - amazon
 	Provider string `json:"provider"`
 
 	// Label represents an optional label which can be used in the UI generation.
@@ -71,9 +71,10 @@ type Configuration struct {
 	Tenant string `json:"microsoft_tenant"`
 
 	// SubjectSource is a flag which controls from which endpoint the subject identifier is taken by microsoft provider.
-	// Can be either `userinfo` or `me`.
+	// Can be either `userinfo` or `me` or `oid`.
 	// If the value is `userinfo` then the subject identifier is taken from sub field of userinfo standard endpoint response.
 	// If the value is `me` then the `id` field of https://graph.microsoft.com/v1.0/me response is taken as subject.
+	// If the value is `oid` then the the oid (Object ID) is taken to identify users across different services.
 	// The default is `userinfo`.
 	SubjectSource string `json:"subject_source"`
 
@@ -129,6 +130,14 @@ type Configuration struct {
 	// Instead of <base-url>/self-service/methods/oidc/callback/<provider>, you must use <base-url>/self-service/methods/oidc/callback
 	// (Note the missing <provider> path segment and no trailing slash).
 	PKCE string `json:"pkce"`
+
+	// FedCMConfigURL is the URL to the FedCM IdP configuration file.
+	// This is only effective in the Ory Network.
+	FedCMConfigURL string `json:"fedcm_config_url"`
+
+	// NetIDTokenOriginHeader contains the orgin header to be used when exchanging a
+	// NetID FedCM token for an ID token.
+	NetIDTokenOriginHeader string `json:"net_id_token_origin_header"`
 }
 
 func (p Configuration) Redir(public *url.URL) string {
@@ -138,12 +147,12 @@ func (p Configuration) Redir(public *url.URL) string {
 
 	if p.OrganizationID != "" {
 		route := RouteOrganizationCallback
-		route = strings.Replace(route, ":provider", p.ID, 1)
-		route = strings.Replace(route, ":organization", p.OrganizationID, 1)
+		route = strings.Replace(route, "{provider}", p.ID, 1)
+		route = strings.Replace(route, "{organization}", p.OrganizationID, 1)
 		return urlx.AppendPaths(public, route).String()
 	}
 
-	return urlx.AppendPaths(public, strings.Replace(RouteCallback, ":provider", p.ID, 1)).String()
+	return urlx.AppendPaths(public, strings.Replace(RouteCallback, "{provider}", p.ID, 1)).String()
 }
 
 type ConfigurationCollection struct {
@@ -178,11 +187,14 @@ var supportedProviders = map[string]func(config *Configuration, reg Dependencies
 	"patreon":     NewProviderPatreon,
 	"lark":        NewProviderLark,
 	"x":           NewProviderX,
+	"line":        NewProviderLineV21,
+	"jackson":     NewProviderJackson,
+	"fedcm-test":  NewProviderTestFedcm,
+	"amazon":      NewProviderAmazon,
 }
 
 func (c ConfigurationCollection) Provider(id string, reg Dependencies) (Provider, error) {
-	for k := range c.Providers {
-		p := c.Providers[k]
+	for _, p := range c.Providers {
 		if p.ID == id {
 			if f, ok := supportedProviders[p.Provider]; ok {
 				return f(&p, reg), nil

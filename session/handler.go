@@ -4,12 +4,19 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
+
 	"github.com/ory/kratos/selfservice/sessiontokenexchange"
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/pagination/migrationpagination"
 
 	"github.com/ory/x/pagination/keysetpagination"
@@ -17,7 +24,6 @@ import (
 	"github.com/ory/x/pointerx"
 
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 
 	"github.com/ory/x/decoderx"
@@ -35,7 +41,7 @@ type (
 		x.WriterProvider
 		x.TracingProvider
 		x.LoggingProvider
-		x.CSRFProvider
+		nosurfx.CSRFProvider
 		config.Provider
 		sessiontokenexchange.PersistenceProvider
 		TokenizerProvider
@@ -62,12 +68,12 @@ const (
 	RouteCollection                  = "/sessions"
 	RouteExchangeCodeForSessionToken = RouteCollection + "/token-exchange" // #nosec G101
 	RouteWhoami                      = RouteCollection + "/whoami"
-	RouteSession                     = RouteCollection + "/:id"
+	RouteSession                     = RouteCollection + "/{id}"
 )
 
 const (
 	AdminRouteIdentity           = "/identities"
-	AdminRouteIdentitiesSessions = AdminRouteIdentity + "/:id/sessions"
+	AdminRouteIdentitiesSessions = AdminRouteIdentity + "/{id}/sessions"
 	AdminRouteSessionExtendId    = RouteSession + "/extend"
 )
 
@@ -80,7 +86,7 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 	admin.DELETE(AdminRouteIdentitiesSessions, h.deleteIdentitySessions)
 	admin.PATCH(AdminRouteSessionExtendId, h.adminSessionExtend)
 
-	admin.DELETE(RouteCollection, x.RedirectToPublicRoute(h.r))
+	admin.DELETE(RouteCollection, redir.RedirectToPublicRoute(h.r))
 }
 
 func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
@@ -93,7 +99,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	h.r.CSRFHandler().IgnoreGlob(AdminRouteIdentity + "/*/sessions")
 
 	for _, m := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodConnect, http.MethodOptions, http.MethodTrace} {
-		public.Handle(m, RouteWhoami, h.whoami)
+		public.Handler(m, RouteWhoami, http.HandlerFunc(h.whoami))
 	}
 
 	public.DELETE(RouteCollection, h.deleteMySessions)
@@ -102,7 +108,7 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 
 	public.GET(RouteExchangeCodeForSessionToken, h.exchangeCode)
 
-	public.DELETE(AdminRouteIdentitiesSessions, x.RedirectToAdminRoute(h.r))
+	public.DELETE(AdminRouteIdentitiesSessions, redir.RedirectToAdminRoute(h.r))
 }
 
 // Check Session Request Parameters
@@ -208,7 +214,7 @@ type toSession struct {
 //	  401: errorGeneric
 //	  403: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) whoami(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) whoami(w http.ResponseWriter, r *http.Request) {
 	ctx, span := h.r.Tracer(r.Context()).Tracer().Start(r.Context(), "sessions.Handler.whoami")
 	defer span.End()
 
@@ -216,7 +222,7 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request, _ httprouter.Pa
 	c := h.r.Config()
 	if err != nil {
 		// We cache errors (and set cache header only when configured) where no session was found.
-		if noSess := new(ErrNoActiveSessionFound); c.SessionWhoAmICaching(ctx) && errors.As(err, &noSess) && noSess.credentialsMissing {
+		if noSess := new(ErrNoActiveSessionFound); c.SessionWhoAmICaching(ctx) && errors.As(err, &noSess) && noSess.CredentialsMissing {
 			w.Header().Set("Ory-Session-Cache-For", fmt.Sprintf("%d", int64(time.Minute.Seconds())))
 		}
 
@@ -226,7 +232,7 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request, _ httprouter.Pa
 	}
 
 	var aalErr *ErrAALNotSatisfied
-	if err := h.r.SessionManager().DoesSessionSatisfy(r, s, c.SessionWhoAmIAAL(ctx),
+	if err := h.r.SessionManager().DoesSessionSatisfy(ctx, s, c.SessionWhoAmIAAL(ctx),
 		// For the time being we want to update the AAL in the database if it is unset.
 		UpsertAAL,
 	); errors.As(err, &aalErr) {
@@ -303,8 +309,8 @@ type deleteIdentitySessions struct {
 //	  401: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) deleteIdentitySessions(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	iID, err := uuid.FromString(ps.ByName("id"))
+func (h *Handler) deleteIdentitySessions(w http.ResponseWriter, r *http.Request) {
+	iID, err := uuid.FromString(r.PathValue("id"))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest.WithError(err.Error()).WithDebug("could not parse UUID"))
 		return
@@ -382,7 +388,7 @@ type listSessionsResponse struct {
 //	  200: listSessions
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) adminListSessions(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) adminListSessions(w http.ResponseWriter, r *http.Request) {
 	activeRaw := r.URL.Query().Get("active")
 	activeBool, err := strconv.ParseBool(activeRaw)
 	if activeRaw != "" && err != nil {
@@ -414,13 +420,12 @@ func (h *Handler) adminListSessions(w http.ResponseWriter, r *http.Request, ps h
 		}
 	}
 
-	sess, total, nextPage, err := h.r.SessionPersister().ListSessions(r.Context(), active, opts, expandables)
+	sess, nextPage, err := h.r.SessionPersister().ListSessions(r.Context(), active, opts, expandables)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
 
-	w.Header().Set("x-total-count", fmt.Sprint(total))
 	u := *r.URL
 	keysetpagination.Header(w, &u, nextPage)
 	h.r.Writer().Write(w, r, sess)
@@ -467,14 +472,14 @@ type getSession struct {
 //	  200: session
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getSession(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	if ps.ByName("id") == "whoami" {
+func (h *Handler) getSession(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") == "whoami" {
 		// for /admin/sessions/whoami redirect to the public route
-		x.RedirectToPublicRoute(h.r)(w, r, ps)
+		redir.RedirectToPublicRoute(h.r)(w, r)
 		return
 	}
 
-	sID, err := uuid.FromString(ps.ByName("id"))
+	sID, err := uuid.FromString(r.PathValue("id"))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest.WithError(err.Error()).WithDebug("could not parse UUID"))
 		return
@@ -536,8 +541,8 @@ type disableSession struct {
 //		400: errorGeneric
 //		401: errorGeneric
 //		default: errorGeneric
-func (h *Handler) disableSession(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	sID, err := uuid.FromString(ps.ByName("id"))
+func (h *Handler) disableSession(w http.ResponseWriter, r *http.Request) {
+	sID, err := uuid.FromString(r.PathValue("id"))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest.WithError(err.Error()).WithDebug("could not parse UUID"))
 		return
@@ -602,8 +607,8 @@ type listIdentitySessionsResponse struct {
 //	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) listIdentitySessions(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	iID, err := uuid.FromString(ps.ByName("id"))
+func (h *Handler) listIdentitySessions(w http.ResponseWriter, r *http.Request) {
+	iID, err := uuid.FromString(r.PathValue("id"))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithError(err.Error()).WithDebug("could not parse UUID")))
 		return
@@ -676,7 +681,7 @@ type disableMyOtherSessions struct {
 //	  400: errorGeneric
 //	  401: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) deleteMySessions(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) deleteMySessions(w http.ResponseWriter, r *http.Request) {
 	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
 		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
@@ -735,11 +740,11 @@ type disableMySession struct {
 //	  400: errorGeneric
 //	  401: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) deleteMySession(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	sid := ps.ByName("id")
+func (h *Handler) deleteMySession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("id")
 	if sid == "whoami" {
 		// Special case where we actually want to handle the whoami endpoint.
-		h.whoami(w, r, ps)
+		h.whoami(w, r)
 		return
 	}
 
@@ -819,7 +824,7 @@ type listMySessionsResponse struct {
 //	  400: errorGeneric
 //	  401: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request) {
 	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
 		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
@@ -827,8 +832,21 @@ func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request, _ httpr
 		return
 	}
 
+	c := h.r.Config()
+
+	var aalErr *ErrAALNotSatisfied
+	if err := h.r.SessionManager().DoesSessionSatisfy(r.Context(), s, c.SessionWhoAmIAAL(r.Context())); errors.As(err, &aalErr) {
+		h.r.Audit().WithRequest(r).WithError(err).Info("Session was found but AAL is not satisfied for calling this endpoint.")
+		h.r.Writer().WriteError(w, r, err)
+		return
+	} else if err != nil {
+		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized.WithWrap(err).WithReasonf("Unable to determine AAL."))
+		return
+	}
+
 	page, perPage := x.ParsePagination(r)
-	sess, total, err := h.r.SessionPersister().ListSessionsByIdentity(r.Context(), s.IdentityID, pointerx.Bool(true), page, perPage, s.ID, ExpandEverything)
+	sess, total, err := h.r.SessionPersister().ListSessionsByIdentity(r.Context(), s.IdentityID, pointerx.Ptr(true), page, perPage, s.ID, ExpandEverything)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
@@ -838,11 +856,19 @@ func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request, _ httpr
 	h.r.Writer().Write(w, r, sess)
 }
 
-func (h *Handler) IsAuthenticated(wrap httprouter.Handle, onUnauthenticated httprouter.Handle) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		if _, err := h.r.SessionManager().FetchFromRequest(r.Context(), r); err != nil {
+type sessionInContext int
+
+const (
+	sessionInContextKey sessionInContext = iota
+)
+
+func (h *Handler) IsAuthenticated(wrap http.HandlerFunc, onUnauthenticated http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		sess, err := h.r.SessionManager().FetchFromRequest(ctx, r)
+		if err != nil {
 			if onUnauthenticated != nil {
-				onUnauthenticated(w, r, ps)
+				onUnauthenticated(w, r)
 				return
 			}
 
@@ -850,7 +876,7 @@ func (h *Handler) IsAuthenticated(wrap httprouter.Handle, onUnauthenticated http
 			return
 		}
 
-		wrap(w, r, ps)
+		wrap(w, r.WithContext(context.WithValue(ctx, sessionInContextKey, sess)))
 	}
 }
 
@@ -893,8 +919,8 @@ type extendSession struct {
 //	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) adminSessionExtend(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	id, err := uuid.FromString(ps.ByName("id"))
+func (h *Handler) adminSessionExtend(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.FromString(r.PathValue("id"))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest.WithError(err.Error()).WithDebug("could not parse UUID")))
 		return
@@ -912,6 +938,8 @@ func (h *Handler) adminSessionExtend(w http.ResponseWriter, r *http.Request, ps 
 		return
 	}
 
+	trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "legacy_slower_session_extend"))
+
 	// WARNING - this will be deprecated at some point!
 	s, err := h.r.SessionPersister().GetSession(r.Context(), id, ExpandDefault)
 	if err != nil {
@@ -921,11 +949,11 @@ func (h *Handler) adminSessionExtend(w http.ResponseWriter, r *http.Request, ps 
 	h.r.Writer().Write(w, r, s)
 }
 
-func (h *Handler) IsNotAuthenticated(wrap httprouter.Handle, onAuthenticated httprouter.Handle) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) IsNotAuthenticated(wrap http.HandlerFunc, onAuthenticated http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.r.SessionManager().FetchFromRequest(r.Context(), r); err != nil {
 			if e := new(ErrNoActiveSessionFound); errors.As(err, &e) {
-				wrap(w, r, ps)
+				wrap(w, r)
 				return
 			}
 			h.r.Writer().WriteError(w, r, err)
@@ -933,7 +961,7 @@ func (h *Handler) IsNotAuthenticated(wrap httprouter.Handle, onAuthenticated htt
 		}
 
 		if onAuthenticated != nil {
-			onAuthenticated(w, r, ps)
+			onAuthenticated(w, r)
 			return
 		}
 
@@ -941,10 +969,10 @@ func (h *Handler) IsNotAuthenticated(wrap httprouter.Handle, onAuthenticated htt
 	}
 }
 
-func RedirectOnAuthenticated(d interface{ config.Provider }) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func RedirectOnAuthenticated(d interface{ config.Provider }) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		returnTo, err := x.SecureRedirectTo(r, d.Config().SelfServiceBrowserDefaultReturnTo(ctx), x.SecureRedirectAllowSelfServiceURLs(d.Config().SelfPublicURL(ctx)))
+		returnTo, err := redir.SecureRedirectTo(r, d.Config().SelfServiceBrowserDefaultReturnTo(ctx), redir.SecureRedirectAllowSelfServiceURLs(d.Config().SelfPublicURL(ctx)))
 		if err != nil {
 			http.Redirect(w, r, d.Config().SelfServiceBrowserDefaultReturnTo(ctx).String(), http.StatusFound)
 			return
@@ -954,14 +982,14 @@ func RedirectOnAuthenticated(d interface{ config.Provider }) httprouter.Handle {
 	}
 }
 
-func RedirectOnUnauthenticated(to string) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func RedirectOnUnauthenticated(to string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, to, http.StatusFound)
 	}
 }
 
-func RespondWitherrorGenericOnAuthenticated(h herodot.Writer, err error) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func RespondWitherrorGenericOnAuthenticated(h herodot.Writer, err error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		h.WriteError(w, r, err)
 	}
 }
@@ -1024,7 +1052,7 @@ type CodeExchangeResponse struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) exchangeCode(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) exchangeCode(w http.ResponseWriter, r *http.Request) {
 	var (
 		ctx          = r.Context()
 		initCode     = r.URL.Query().Get("init_code")

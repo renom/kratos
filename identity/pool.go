@@ -6,14 +6,38 @@ package identity
 import (
 	"context"
 
-	"github.com/ory/x/crdbx"
-
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/crdbx"
 	"github.com/ory/x/pagination/keysetpagination"
 	"github.com/ory/x/sqlxx"
 
 	"github.com/gofrs/uuid"
 )
+
+func NewUpdateIdentityOptions(opts []UpdateIdentityModifier) UpdateIdentityOptions {
+	var o UpdateIdentityOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// DiffAgainst sets the identity as it is stored in the database before the update.
+// DiffAgainst instructs UpdateIdentity to attempt a minimal update of the
+// identity's data in the database by computing a diff against `existing` and
+// only updating what is necessary, rather than bulk-replacing everything. Use
+// with caution. If `existing` is different from what is stored in the database
+// at the time of the update, the results are undefined. An error is returned if
+// `existing` has a mismatching IdentityID or NID.
+func DiffAgainst(existing *Identity) UpdateIdentityModifier {
+	return func(o *UpdateIdentityOptions) {
+		o.fromDatabase = existing
+	}
+}
+
+func (o UpdateIdentityOptions) FromDatabase() *Identity {
+	return o.fromDatabase
+}
 
 type (
 	ListIdentityParameters struct {
@@ -23,11 +47,17 @@ type (
 		CredentialsIdentifierSimilar string
 		DeclassifyCredentials        []CredentialsType
 		KeySetPagination             []keysetpagination.Option
+		OrganizationID               uuid.UUID
 		ConsistencyLevel             crdbx.ConsistencyLevel
 		StatementTransformer         func(string) string
 
 		// DEPRECATED
 		PagePagination *x.Page
+	}
+
+	UpdateIdentityModifier func(*UpdateIdentityOptions)
+	UpdateIdentityOptions  struct {
+		fromDatabase *Identity
 	}
 
 	Pool interface {
@@ -46,6 +76,9 @@ type (
 
 		// FindRecoveryAddressByValue returns a matching address or sql.ErrNoRows if no address could be found.
 		FindRecoveryAddressByValue(ctx context.Context, via RecoveryAddressType, address string) (*RecoveryAddress, error)
+
+		// FindAllRecoveryAddressesForIdentityByRecoveryAddressValue finds all recovery addresses for an identity if at least one of its recovery addresses matches the provided value.
+		FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) ([]RecoveryAddress, error)
 	}
 
 	PoolProvider interface {
@@ -71,7 +104,7 @@ type (
 		DeleteIdentities(context.Context, []uuid.UUID) error
 
 		// UpdateVerifiableAddress updates an identity's verifiable address.
-		UpdateVerifiableAddress(ctx context.Context, address *VerifiableAddress) error
+		UpdateVerifiableAddress(ctx context.Context, address *VerifiableAddress, updateColumns ...string) error
 
 		// CreateIdentity creates an identity. It is capable of setting credentials without encoding. Will return an error
 		// if identity exists, backend connectivity is broken, or trait validation fails.
@@ -82,7 +115,7 @@ type (
 		CreateIdentities(context.Context, ...*Identity) error
 
 		// UpdateIdentity updates an identity including its confidential / privileged / protected data.
-		UpdateIdentity(context.Context, *Identity) error
+		UpdateIdentity(context.Context, *Identity, ...UpdateIdentityModifier) error
 
 		// UpdateIdentityColumns updates targeted columns of an identity.
 		UpdateIdentityColumns(ctx context.Context, i *Identity, columns ...string) error
@@ -114,6 +147,9 @@ type (
 
 		// FindIdentityByWebauthnUserHandle returns an identity matching a webauthn user handle.
 		FindIdentityByWebauthnUserHandle(ctx context.Context, userHandle []byte) (*Identity, error)
+
+		// FindIdentityByCredentialsIdentifier returns an identity by its external ID.
+		FindIdentityByExternalID(ctx context.Context, externalID string, expand sqlxx.Expandables) (*Identity, error)
 	}
 )
 

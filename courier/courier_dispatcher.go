@@ -5,8 +5,14 @@ package courier
 
 import (
 	"context"
+	"time"
 
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/x/events"
+	"github.com/ory/x/otelx"
 )
 
 func (c *courier) channels(ctx context.Context, id string) (Channel, error) {
@@ -27,7 +33,7 @@ func (c *courier) channels(ctx context.Context, id string) (Channel, error) {
 			}
 			return courierChannel, nil
 		case "http":
-			return newHttpChannel(channel.ID, channel.RequestConfig, c.deps), nil
+			return newHttpChannel(channel.ID, &channel.RequestConfig, c.deps), nil
 		default:
 			return nil, errors.Errorf("unknown courier channel type: %s", channel.Type)
 		}
@@ -36,13 +42,23 @@ func (c *courier) channels(ctx context.Context, id string) (Channel, error) {
 	return nil, errors.Errorf("no courier channels configured")
 }
 
-func (c *courier) DispatchMessage(ctx context.Context, msg Message) error {
+func (c *courier) DispatchMessage(ctx context.Context, msg Message) (err error) {
+	ctx, span := c.deps.Tracer(ctx).Tracer().Start(ctx, "courier.DispatchMessage", trace.WithAttributes(
+		attribute.Stringer("message.id", msg.ID),
+		attribute.Stringer("message.nid", msg.NID),
+		attribute.Stringer("message.type", msg.Type),
+		attribute.String("message.template_type", string(msg.TemplateType)),
+		attribute.Int("message.send_count", msg.SendCount),
+	))
+	defer otelx.End(span, &err)
+
 	logger := c.deps.Logger().
 		WithField("message_id", msg.ID).
 		WithField("message_nid", msg.NID).
 		WithField("message_type", msg.Type).
 		WithField("message_template_type", msg.TemplateType).
-		WithField("message_subject", msg.Subject)
+		WithField("message_subject", msg.Subject).
+		WithField("trace_id", span.SpanContext().TraceID())
 
 	if err := c.deps.CourierPersister().IncrementMessageSendCount(ctx, msg.ID); err != nil {
 		logger.
@@ -56,12 +72,14 @@ func (c *courier) DispatchMessage(ctx context.Context, msg Message) error {
 		return err
 	}
 
+	span.SetAttributes(attribute.String("channel.id", channel.ID()))
 	logger = logger.
 		WithField("channel", channel.ID())
 
 	if err := channel.Dispatch(ctx, msg); err != nil {
 		return err
 	}
+	span.AddEvent(events.NewCourierMessageDispatched(ctx, msg.ID, msg.Channel.String(), string(msg.TemplateType)))
 
 	if err := c.deps.CourierPersister().SetMessageStatus(ctx, msg.ID, MessageStatusSent); err != nil {
 		logger.
@@ -70,15 +88,19 @@ func (c *courier) DispatchMessage(ctx context.Context, msg Message) error {
 		return err
 	}
 
-	logger.Debug("Courier sent out message.")
+	dispatchDuration := time.Since(msg.CreatedAt).Milliseconds()
+	logger.WithField("dispatch_duration_ms", dispatchDuration).Debug("Courier sent out message.")
 
 	return nil
 }
 
-func (c *courier) DispatchQueue(ctx context.Context) error {
+func (c *courier) DispatchQueue(ctx context.Context) (err error) {
+	ctx, span := c.deps.Tracer(ctx).Tracer().Start(ctx, "courier.DispatchQueue")
+	defer otelx.End(span, &err)
 	maxRetries := c.deps.CourierConfig().CourierMessageRetries(ctx)
 	pullCount := c.deps.CourierConfig().CourierWorkerPullCount(ctx)
 
+	//nolint:gosec // disable G115
 	messages, err := c.deps.CourierPersister().NextMessages(ctx, uint8(pullCount))
 	if err != nil {
 		if errors.Is(err, ErrQueueEmpty) {
@@ -86,6 +108,7 @@ func (c *courier) DispatchQueue(ctx context.Context) error {
 		}
 		return err
 	}
+	span.SetAttributes(attribute.Int("messages_count", len(messages)))
 
 	for k, msg := range messages {
 		logger := c.deps.Logger().
@@ -102,6 +125,8 @@ func (c *courier) DispatchQueue(ctx context.Context) error {
 					Error(`Unable to set the retried message's status to "abandoned".`)
 				return err
 			}
+
+			span.AddEvent(events.NewCourierMessageAbandoned(ctx, msg.ID, msg.Channel.String(), string(msg.TemplateType)))
 
 			// Skip the message
 			logger.

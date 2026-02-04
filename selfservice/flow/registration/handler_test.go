@@ -18,19 +18,13 @@ import (
 
 	"github.com/go-faker/faker/v4"
 	"github.com/gofrs/uuid"
-
-	"github.com/ory/kratos/corpx"
-	"github.com/ory/kratos/hydra"
-	"github.com/ory/x/ioutilx"
-	"github.com/ory/x/urlx"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/ory/x/assertx"
-
+	"github.com/ory/kratos/corpx"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
 	"github.com/ory/kratos/internal/testhelpers"
@@ -39,6 +33,10 @@ import (
 	"github.com/ory/kratos/selfservice/strategy/oidc"
 	"github.com/ory/kratos/selfservice/strategy/password"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/ioutilx"
+	"github.com/ory/x/urlx"
 )
 
 func init() {
@@ -49,10 +47,10 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 	fakeHydra := hydra.NewFake()
-	reg.WithHydra(fakeHydra)
+	reg.SetHydra(fakeHydra)
 
-	router := x.NewRouterPublic()
-	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(reg)
+	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin(reg))
 
 	// Set it first as otherwise it will overwrite the ViperKeySelfServiceBrowserDefaultReturnTo key;
 	returnToTS := testhelpers.NewRedirTS(t, "return_to", conf)
@@ -63,19 +61,19 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 
 	t.Run("does redirect to default on authenticated request", func(t *testing.T) {
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow, nil))
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow, nil))
 		assert.Contains(t, res.Request.URL.String(), redirTS.URL)
 		assert.EqualValues(t, "already authenticated", string(body))
 	})
 
 	t.Run("does redirect to default on authenticated request", func(t *testing.T) {
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitAPIFlow, nil))
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitAPIFlow, nil))
 		assert.Contains(t, res.Request.URL.String(), registration.RouteInitAPIFlow)
 		assertx.EqualAsJSON(t, registration.ErrAlreadyLoggedIn, json.RawMessage(gjson.GetBytes(body, "error").Raw))
 	})
 
 	t.Run("does redirect to return_to url on authenticated request", func(t *testing.T) {
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?return_to="+returnToTS.URL, nil))
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?return_to="+returnToTS.URL, nil))
 		assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 		assert.EqualValues(t, "return_to", string(body))
 	})
@@ -90,7 +88,7 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
-		_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?login_challenge="+hydra.FakeValidLoginChallenge, nil), client)
+		_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?login_challenge="+hydra.FakeValidLoginChallenge, nil), client)
 		assert.Contains(t, res.Header.Get("location"), login.RouteInitBrowserFlow)
 	})
 
@@ -104,7 +102,7 @@ func TestHandlerRedirectOnAuthenticated(t *testing.T) {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
-		_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, router.Router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?login_challenge="+hydra.FakeValidLoginChallenge, nil), client)
+		_, res := testhelpers.MockMakeAuthenticatedRequestWithClient(t, reg, conf, router, testhelpers.NewTestHTTPRequest(t, "GET", ts.URL+registration.RouteInitBrowserFlow+"?login_challenge="+hydra.FakeValidLoginChallenge, nil), client)
 		assert.Contains(t, res.Header.Get("location"), hydra.FakePostLoginURL)
 	})
 }
@@ -115,13 +113,22 @@ func TestInitFlow(t *testing.T) {
 	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword),
 		map[string]interface{}{"enabled": true})
 
-	router := x.NewRouterPublic()
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(reg)
+	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin(reg))
 	registrationTS := testhelpers.NewRegistrationUIFlowEchoServer(t, reg)
+	returnToTS := testhelpers.NewRedirTS(t, "return_to", conf)
 
 	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, true)
-	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
+	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToTS.URL)
+
+	conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+		{ID: "default", URL: "file://./stub/registration.schema.json"},
+		{ID: "email", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+		{ID: "phone", URL: "file://./stub/registration.phone.schema.json", SelfserviceSelectable: true},
+		{ID: "not-allowed", URL: "file://./stub/registration.schema.json"},
+	})
+	conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "email")
+	errTS := testhelpers.NewErrorTestServer(t, reg)
 
 	assertion := func(body []byte, isForced, isApi bool) {
 		if isApi {
@@ -140,7 +147,7 @@ func TestInitFlow(t *testing.T) {
 		if isSPA {
 			req.Header.Set("Accept", "application/json")
 		}
-		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router.Router, req)
+		body, res := testhelpers.MockMakeAuthenticatedRequest(t, reg, conf, router, req)
 		if isAPI {
 			assert.Len(t, res.Header.Get("Set-Cookie"), 0)
 		}
@@ -161,7 +168,7 @@ func TestInitFlow(t *testing.T) {
 
 		res, err := c.Do(req)
 		require.NoError(t, err)
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res, body
@@ -174,6 +181,58 @@ func TestInitFlow(t *testing.T) {
 	initSPAFlow := func(t *testing.T) (*http.Response, []byte) {
 		return initFlowWithAccept(t, url.Values{}, false, "application/json")
 	}
+
+	t.Run("suite=identity schema in query", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			query   url.Values
+			wantErr bool
+			assert  func(*testing.T, []byte)
+		}{{
+			name:    "not-allowed",
+			query:   url.Values{"identity_schema": {"not-allowed"}},
+			wantErr: true,
+		}, {
+			name:    "not-found",
+			query:   url.Values{"identity_schema": {"not-found"}},
+			wantErr: true,
+		}, {
+			name:  "phone",
+			query: url.Values{"identity_schema": {"phone"}},
+			assert: func(t *testing.T, body []byte) {
+				assert.True(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.phone)").Exists(), "%s", body)
+				assert.False(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.email)").Exists(), "%s", body)
+			},
+		}, {
+			name:  "email",
+			query: url.Values{"identity_schema": {"email"}},
+			assert: func(t *testing.T, body []byte) {
+				assert.False(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.phone)").Exists(), "%s", body)
+				assert.True(t, gjson.GetBytes(body, "ui.nodes.#(attributes.name==traits.email)").Exists(), "%s", body)
+			},
+		}} {
+			t.Run("case="+tc.name, func(t *testing.T) {
+				t.Run("flow=api", func(t *testing.T) {
+					res, body := initFlow(t, tc.query, true)
+					if tc.wantErr {
+						assert.Equal(t, http.StatusBadRequest, res.StatusCode)
+						return
+					}
+					tc.assert(t, body)
+				})
+
+				t.Run("flow=browser", func(t *testing.T) {
+					res, body := initFlow(t, tc.query, false)
+					if tc.wantErr {
+						require.Contains(t, res.Request.URL.String(), errTS.URL, "%s", body)
+						assert.EqualValues(t, "Bad Request", gjson.GetBytes(body, "status").String(), "%s", body)
+						return
+					}
+					tc.assert(t, body)
+				})
+			})
+		}
+	})
 
 	t.Run("flow=api", func(t *testing.T) {
 		t.Run("case=creates a new flow on unauthenticated request", func(t *testing.T) {
@@ -219,12 +278,12 @@ func TestInitFlow(t *testing.T) {
 
 		t.Run("case=redirects when already authenticated", func(t *testing.T) {
 			res, _ := initAuthenticatedFlow(t, false, false)
-			assert.Contains(t, res.Request.URL.String(), "https://www.ory.sh")
+			assert.Contains(t, res.Request.URL.String(), returnToTS.URL)
 		})
 
 		t.Run("case=responds with error if already authenticated and SPA", func(t *testing.T) {
 			res, body := initAuthenticatedFlow(t, false, true)
-			assert.NotContains(t, res.Request.URL.String(), "https://www.ory.sh")
+			assert.NotContains(t, res.Request.URL.String(), returnToTS.URL)
 			assert.Equal(t, http.StatusBadRequest, res.StatusCode)
 			assertx.EqualAsJSON(t, registration.ErrAlreadyLoggedIn, json.RawMessage(gjson.GetBytes(body, "error").Raw), "%s", body)
 		})
@@ -251,7 +310,7 @@ func TestInitFlow(t *testing.T) {
 
 			res, err := c.Do(req)
 			require.NoError(t, err)
-			defer res.Body.Close()
+			defer func() { _ = res.Body.Close() }()
 			// here we check that the redirect status is 303
 			require.Equal(t, http.StatusSeeOther, res.StatusCode)
 		})
@@ -281,7 +340,7 @@ func TestDisabledFlow(t *testing.T) {
 
 		res, err := c.Do(req)
 		require.NoError(t, err)
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res, body
@@ -320,7 +379,15 @@ func TestGetFlow(t *testing.T) {
 	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, true)
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
+	returnToTS := testhelpers.NewRedirTS(t, "return_to", conf)
+
+	conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+		{ID: "email", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+		{ID: "phone", URL: "file://./stub/registration.phone.schema.json", SelfserviceSelectable: true},
+		{ID: "not-allowed", URL: "file://./stub/registration.schema.json"},
+	})
+	conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "email")
+
 	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword),
 		map[string]interface{}{"enabled": true})
 
@@ -355,7 +422,7 @@ func TestGetFlow(t *testing.T) {
 		_ = setupRegistrationUI(t, client)
 		body := testhelpers.EasyGetBody(t, client, public.URL+registration.RouteInitBrowserFlow)
 
-		assert.EqualValues(t, x.ErrInvalidCSRFToken.ReasonField, gjson.GetBytes(body, "error.reason").String(), "%s", body)
+		assert.EqualValues(t, nosurfx.ErrInvalidCSRFToken.ReasonField, gjson.GetBytes(body, "error.reason").String(), "%s", body)
 	})
 
 	t.Run("case=expired", func(t *testing.T) {
@@ -374,13 +441,15 @@ func TestGetFlow(t *testing.T) {
 		assert.Equal(t, public.URL+registration.RouteInitBrowserFlow, gjson.GetBytes(body, "error.details.redirect_to").String(), "%s", body)
 	})
 
-	t.Run("case=expired with return_to", func(t *testing.T) {
-		returnTo := "https://www.ory.sh"
+	t.Run("case=expired with return_to and identity_schema", func(t *testing.T) {
+		returnTo := returnToTS.URL
 		conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnTo})
 
 		client := testhelpers.NewClientWithCookies(t)
 		setupRegistrationUI(t, client)
-		body := testhelpers.EasyGetBody(t, client, public.URL+registration.RouteInitBrowserFlow+"?return_to="+returnTo)
+		body := testhelpers.EasyGetBody(t, client, public.URL+registration.RouteInitBrowserFlow+
+			"?return_to="+returnTo+
+			"&identity_schema=email")
 
 		// Expire the flow
 		f, err := reg.RegistrationFlowPersister().GetRegistrationFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(body, "id").String()))
@@ -403,7 +472,7 @@ func TestGetFlow(t *testing.T) {
 
 		f, err = reg.RegistrationFlowPersister().GetRegistrationFlow(context.Background(), uuid.FromStringOrNil(gjson.GetBytes(resBody, "id").String()))
 		require.NoError(t, err)
-		assert.Equal(t, public.URL+registration.RouteInitBrowserFlow+"?return_to="+returnTo, f.RequestURL)
+		assert.Equal(t, public.URL+registration.RouteInitBrowserFlow+"?return_to="+returnTo+"&identity_schema=email", f.RequestURL)
 	})
 
 	t.Run("case=not found", func(t *testing.T) {
@@ -426,7 +495,7 @@ func TestOIDCStrategyOrder(t *testing.T) {
 
 	// reorder the strategies
 	reg.WithSelfserviceStrategies(t, []any{
-		oidc.NewStrategy(reg),
+		oidc.NewStrategy(reg, oidc.ForCredentialType(identity.CredentialsTypeOIDC)),
 		password.NewStrategy(reg),
 	})
 
@@ -512,10 +581,14 @@ func TestOIDCStrategyOrder(t *testing.T) {
 
 		resp, err := client.Do(req)
 		require.NoError(t, err)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.Containsf(t, gjson.GetBytes(b, "error.reason").String(), "In order to complete this flow please redirect the browser to: https://accounts.google.com/o/oauth2/v2/auth", "accounts.google.com", "%s", b)
+		require.Containsf(t,
+			gjson.GetBytes(b, "error.reason").String(),
+			"In order to complete this flow please redirect the browser to: https://accounts.google.com/o/oauth2/v2/auth",
+			"%s", b,
+		)
 	})
 }

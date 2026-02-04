@@ -9,8 +9,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
-	"crypto/md5"  //#nosec G501 -- compatibility for imported passwords
-	"crypto/sha1" //#nosec G505 -- compatibility for imported passwords
+	"crypto/md5"  //nolint:all // System compatibility for imported passwords
+	"crypto/sha1" //nolint:all // System compatibility for imported passwords
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
@@ -21,6 +21,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/go-crypt/crypt"
+	"github.com/go-crypt/crypt/algorithm/md5crypt"
+	"github.com/go-crypt/crypt/algorithm/shacrypt"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -29,13 +32,9 @@ import (
 
 	//nolint:staticcheck
 	//lint:ignore SA1019 compatibility for imported passwords
-	"golang.org/x/crypto/md4" //#nosec G501 -- compatibility for imported passwords
+	"golang.org/x/crypto/md4" //nolint:gosec // disable G115 G501 -- compatibility for imported passwords
 	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/crypto/scrypt"
-
-	"github.com/go-crypt/crypt"
-	"github.com/go-crypt/crypt/algorithm/md5crypt"
-	"github.com/go-crypt/crypt/algorithm/shacrypt"
 
 	"github.com/ory/kratos/driver/config"
 )
@@ -60,57 +59,100 @@ func NewCryptDecoder() *crypt.Decoder {
 
 var CryptDecoder = NewCryptDecoder()
 
-func Compare(ctx context.Context, password []byte, hash []byte) error {
+type SupportedHasher struct {
+	Comparator func(ctx context.Context, password, hash []byte) error
+	Name       string
+	Is         func(hash []byte) bool
+}
+
+func AddSupportedHasher(s SupportedHasher) {
+	supportedHashers = append(supportedHashers, s)
+}
+
+var supportedHashers = []SupportedHasher{
+	{
+		Comparator: CompareMD5Crypt,
+		Name:       "md5crypt",
+		Is:         IsMD5CryptHash,
+	},
+	{
+		Comparator: CompareBcrypt,
+		Name:       "bcrypt",
+		Is:         IsBcryptHash,
+	},
+	{
+		Comparator: CompareSHA256Crypt,
+		Name:       "sha256crypt",
+		Is:         IsSHA256CryptHash,
+	},
+	{
+		Comparator: CompareSHA512Crypt,
+		Name:       "sha512crypt",
+		Is:         IsSHA512CryptHash,
+	},
+	{
+		Comparator: CompareArgon2id,
+		Name:       "argon2id",
+		Is:         IsArgon2idHash,
+	},
+	{
+		Comparator: CompareArgon2i,
+		Name:       "argon2i",
+		Is:         IsArgon2iHash,
+	},
+	{
+		Comparator: ComparePbkdf2,
+		Name:       "pbkdf2",
+		Is:         IsPbkdf2Hash,
+	},
+	{
+		Comparator: CompareScrypt,
+		Name:       "scrypt",
+		Is:         IsScryptHash,
+	},
+	{
+		Comparator: CompareSSHA,
+		Name:       "ssha",
+		Is:         IsSSHAHash,
+	},
+	{
+		Comparator: CompareSHA,
+		Name:       "sha",
+		Is:         IsSHAHash,
+	},
+	{
+		Comparator: CompareFirebaseScrypt,
+		Name:       "firebasescrypt",
+		Is:         IsFirebaseScryptHash,
+	},
+	{
+		Comparator: CompareMD5,
+		Name:       "md5",
+		Is:         IsMD5Hash,
+	},
+	{
+		Comparator: CompareHMAC,
+		Name:       "hmac",
+		Is:         IsHMACHash,
+	},
+}
+
+func Compare(ctx context.Context, password, hash []byte) error {
 	ctx, span := otel.GetTracerProvider().Tracer(tracingComponent).Start(ctx, "hash.Compare")
 	defer span.End()
 
-	switch {
-	case IsMD5CryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "md5crypt"))
-		return CompareMD5Crypt(ctx, password, hash)
-	case IsBcryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "bcrypt"))
-		return CompareBcrypt(ctx, password, hash)
-	case IsSHA256CryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "sha256"))
-		return CompareSHA256Crypt(ctx, password, hash)
-	case IsSHA512CryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "sha512"))
-		return CompareSHA512Crypt(ctx, password, hash)
-	case IsArgon2idHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "argon2id"))
-		return CompareArgon2id(ctx, password, hash)
-	case IsArgon2iHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "argon2i"))
-		return CompareArgon2i(ctx, password, hash)
-	case IsPbkdf2Hash(hash):
-		span.SetAttributes(attribute.String("hash.type", "pbkdf2"))
-		return ComparePbkdf2(ctx, password, hash)
-	case IsScryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "scrypt"))
-		return CompareScrypt(ctx, password, hash)
-	case IsSSHAHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "ssha"))
-		return CompareSSHA(ctx, password, hash)
-	case IsSHAHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "sha"))
-		return CompareSHA(ctx, password, hash)
-	case IsFirebaseScryptHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "firebasescrypt"))
-		return CompareFirebaseScrypt(ctx, password, hash)
-	case IsMD5Hash(hash):
-		span.SetAttributes(attribute.String("hash.type", "md5"))
-		return CompareMD5(ctx, password, hash)
-	case IsHMACHash(hash):
-		span.SetAttributes(attribute.String("hash.type", "hmac"))
-		return CompareHMAC(ctx, password, hash)
-	default:
-		span.SetAttributes(attribute.String("hash.type", "unknown"))
-		return errors.WithStack(ErrUnknownHashAlgorithm)
+	for _, h := range supportedHashers {
+		if h.Is(hash) {
+			span.SetAttributes(attribute.String("hash.type", h.Name))
+			return h.Comparator(ctx, password, hash)
+		}
 	}
+
+	span.SetAttributes(attribute.String("hash.type", "unknown"))
+	return errors.WithStack(ErrUnknownHashAlgorithm)
 }
 
-func CompareMD5Crypt(_ context.Context, password []byte, hash []byte) error {
+func CompareMD5Crypt(_ context.Context, password, hash []byte) error {
 	// the password has successfully been validated (has prefix `$md5-crypt`),
 	// the decoder expect the module crypt identifier instead (`$1`), which means we need to replace the prefix
 	// before decoding
@@ -120,9 +162,14 @@ func CompareMD5Crypt(_ context.Context, password []byte, hash []byte) error {
 	return compareCryptHelper(password, string(hash))
 }
 
-func CompareBcrypt(_ context.Context, password []byte, hash []byte) error {
+func CompareBcrypt(ctx context.Context, password, hash []byte) error {
 	if err := validateBcryptPasswordLength(password); err != nil {
 		return err
+	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	err := bcrypt.CompareHashAndPassword(hash, password)
@@ -136,21 +183,21 @@ func CompareBcrypt(_ context.Context, password []byte, hash []byte) error {
 	return nil
 }
 
-func CompareSHA256Crypt(_ context.Context, password []byte, hash []byte) error {
+func CompareSHA256Crypt(_ context.Context, password, hash []byte) error {
 	hash = bytes.TrimPrefix(hash, []byte("$sha256-crypt"))
 	hash = append([]byte("$5"), hash...)
 
 	return compareCryptHelper(password, string(hash))
 }
 
-func CompareSHA512Crypt(_ context.Context, password []byte, hash []byte) error {
+func CompareSHA512Crypt(_ context.Context, password, hash []byte) error {
 	hash = bytes.TrimPrefix(hash, []byte("$sha512-crypt"))
 	hash = append([]byte("$6"), hash...)
 
 	return compareCryptHelper(password, string(hash))
 }
 
-func CompareArgon2id(_ context.Context, password []byte, hash []byte) error {
+func CompareArgon2id(ctx context.Context, password, hash []byte) error {
 	// Extract the parameters, salt and derived key from the encoded password
 	// hash.
 	p, salt, hash, err := decodeArgon2idHash(string(hash))
@@ -158,13 +205,19 @@ func CompareArgon2id(_ context.Context, password []byte, hash []byte) error {
 		return err
 	}
 
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	// Derive the key from the other password using the same parameters.
+	//nolint:gosec // disable G115
 	otherHash := argon2.IDKey(password, salt, p.Iterations, uint32(p.Memory), p.Parallelism, p.KeyLength)
 
 	return comparePasswordHashConstantTime(hash, otherHash)
 }
 
-func CompareArgon2i(_ context.Context, password []byte, hash []byte) error {
+func CompareArgon2i(ctx context.Context, password, hash []byte) error {
 	// Extract the parameters, salt and derived key from the encoded password
 	// hash.
 	p, salt, hash, err := decodeArgon2idHash(string(hash))
@@ -172,18 +225,28 @@ func CompareArgon2i(_ context.Context, password []byte, hash []byte) error {
 		return err
 	}
 
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	// Derive the key from the other password using the same parameters.
-	otherHash := argon2.Key(password, salt, p.Iterations, uint32(p.Memory), p.Parallelism, p.KeyLength)
+	otherHash := argon2.Key(password, salt, p.Iterations, uint32(p.Memory), p.Parallelism, p.KeyLength) // #nosec G115 -- memory (KiB) would need to be 2^32 kibibyte to overflow uint32
 
 	return comparePasswordHashConstantTime(hash, otherHash)
 }
 
-func ComparePbkdf2(_ context.Context, password []byte, hash []byte) error {
+func ComparePbkdf2(ctx context.Context, password, hash []byte) error {
 	// Extract the parameters, salt and derived key from the encoded password
 	// hash.
 	p, salt, hash, err := decodePbkdf2Hash(string(hash))
 	if err != nil {
 		return err
+	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Derive the key from the other password using the same parameters.
@@ -192,12 +255,17 @@ func ComparePbkdf2(_ context.Context, password []byte, hash []byte) error {
 	return comparePasswordHashConstantTime(hash, otherHash)
 }
 
-func CompareScrypt(_ context.Context, password []byte, hash []byte) error {
+func CompareScrypt(ctx context.Context, password, hash []byte) error {
 	// Extract the parameters, salt and derived key from the encoded password
 	// hash.
 	p, salt, hash, err := decodeScryptHash(string(hash))
 	if err != nil {
 		return err
+	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Derive the key from the other password using the same parameters.
@@ -209,7 +277,7 @@ func CompareScrypt(_ context.Context, password []byte, hash []byte) error {
 	return comparePasswordHashConstantTime(hash, otherHash)
 }
 
-func CompareSSHA(_ context.Context, password []byte, hash []byte) error {
+func CompareSSHA(ctx context.Context, password, hash []byte) error {
 	hasher, salt, hash, err := decodeSSHAHash(string(hash))
 	if err != nil {
 		return err
@@ -217,10 +285,15 @@ func CompareSSHA(_ context.Context, password []byte, hash []byte) error {
 
 	raw := append(password[:], salt[:]...)
 
-	return compareSHAHelper(hasher, raw, hash)
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return CompareSHAHelper(hasher, raw, hash)
 }
 
-func CompareSHA(_ context.Context, password []byte, hash []byte) error {
+func CompareSHA(ctx context.Context, password, hash []byte) error {
 	hasher, pf, salt, hash, err := decodeSHAHash(string(hash))
 	if err != nil {
 		return err
@@ -229,15 +302,25 @@ func CompareSHA(_ context.Context, password []byte, hash []byte) error {
 	r := strings.NewReplacer("{SALT}", string(salt), "{PASSWORD}", string(password))
 	raw := []byte(r.Replace(string(pf)))
 
-	return compareSHAHelper(hasher, raw, hash)
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return CompareSHAHelper(hasher, raw, hash)
 }
 
-func CompareFirebaseScrypt(_ context.Context, password []byte, hash []byte) error {
+func CompareFirebaseScrypt(ctx context.Context, password, hash []byte) error {
 	// Extract the parameters, salt and derived key from the encoded password
 	// hash.
 	p, salt, saltSeparator, hash, signerKey, err := decodeFirebaseScryptHash(string(hash))
 	if err != nil {
 		return err
+	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Derive the key from the other password using the same parameters.
@@ -260,7 +343,7 @@ func CompareFirebaseScrypt(_ context.Context, password []byte, hash []byte) erro
 	return comparePasswordHashConstantTime(hash, otherHash)
 }
 
-func CompareMD5(_ context.Context, password []byte, hash []byte) error {
+func CompareMD5(ctx context.Context, password, hash []byte) error {
 	// Extract the hash from the encoded password
 	pf, salt, hash, err := decodeMD5Hash(string(hash))
 	if err != nil {
@@ -272,21 +355,32 @@ func CompareMD5(_ context.Context, password []byte, hash []byte) error {
 		r := strings.NewReplacer("{SALT}", string(salt), "{PASSWORD}", string(password))
 		arg = []byte(r.Replace(string(pf)))
 	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	//#nosec G401 -- compatibility for imported passwords
 	otherHash := md5.Sum(arg)
 
 	return comparePasswordHashConstantTime(hash, otherHash[:])
 }
 
-func CompareHMAC(_ context.Context, password []byte, hash []byte) error {
+func CompareHMAC(ctx context.Context, password, hash []byte) error {
 	// Extract the hash from the encoded password
 	hasher, hash, key, err := decodeHMACHash(string(hash))
 	if err != nil {
 		return err
 	}
 
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	mac := hmac.New(hasher, key)
-	_, err = mac.Write([]byte(password))
+	_, err = mac.Write(password)
 	if err != nil {
 		return err
 	}
@@ -327,23 +421,13 @@ func IsMD5Hash(hash []byte) bool            { return isMD5Hash.Match(hash) }
 func IsHMACHash(hash []byte) bool           { return isHMACHash.Match(hash) }
 
 func IsValidHashFormat(hash []byte) bool {
-	if IsMD5CryptHash(hash) ||
-		IsBcryptHash(hash) ||
-		IsSHA256CryptHash(hash) ||
-		IsSHA512CryptHash(hash) ||
-		IsArgon2idHash(hash) ||
-		IsArgon2iHash(hash) ||
-		IsPbkdf2Hash(hash) ||
-		IsScryptHash(hash) ||
-		IsSSHAHash(hash) ||
-		IsSHAHash(hash) ||
-		IsFirebaseScryptHash(hash) ||
-		IsMD5Hash(hash) ||
-		IsHMACHash(hash) {
-		return true
-	} else {
-		return false
+	for _, h := range supportedHashers {
+		if h.Is(hash) {
+			return true
+		}
 	}
+
+	return false
 }
 
 func decodeArgon2idHash(encodedHash string) (p *config.Argon2, salt, hash []byte, err error) {
@@ -371,13 +455,13 @@ func decodeArgon2idHash(encodedHash string) (p *config.Argon2, salt, hash []byte
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.SaltLength = uint32(len(salt))
+	p.SaltLength = uint32(len(salt)) // #nosec G115 -- salt would need to be 2^32 bytes long to overflow uint32
 
 	hash, err = base64.RawStdEncoding.Strict().DecodeString(parts[5])
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.KeyLength = uint32(len(hash))
+	p.KeyLength = uint32(len(hash)) // #nosec G115 -- hash would need to be 2^32 bytes long to overflow uint32
 
 	return p, salt, hash, nil
 }
@@ -406,13 +490,13 @@ func decodePbkdf2Hash(encodedHash string) (p *Pbkdf2, salt, hash []byte, err err
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.SaltLength = uint32(len(salt))
+	p.SaltLength = uint32(len(salt)) // #nosec G115 -- salt would need to be 2^32 bytes long to overflow uint32
 
 	hash, err = base64.RawStdEncoding.Strict().DecodeString(parts[4])
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.KeyLength = uint32(len(hash))
+	p.KeyLength = uint32(len(hash)) // #nosec G115 -- hash would need to be 2^32 bytes long to overflow uint32
 
 	return p, salt, hash, nil
 }
@@ -436,13 +520,13 @@ func decodeScryptHash(encodedHash string) (p *Scrypt, salt, hash []byte, err err
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.SaltLength = uint32(len(salt))
+	p.SaltLength = uint32(len(salt)) // #nosec G115 -- salt would need to be 2^32 bytes long to overflow uint32
 
 	hash, err = base64.StdEncoding.Strict().DecodeString(parts[4])
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	p.KeyLength = uint32(len(hash))
+	p.KeyLength = uint32(len(hash)) // #nosec G115 -- hash would need to be 2^32 bytes long to overflow uint32
 
 	return p, salt, hash, nil
 }
@@ -481,8 +565,8 @@ func decodeSHAHash(encodedHash string) (hasher string, pf, salt, hash []byte, er
 	return hasher, pf, salt, hash, nil
 }
 
-// used for CompareSHA and CompareSSHA
-func compareSHAHelper(hasher string, raw []byte, hash []byte) error {
+// CompareSHAHelper compares the raw password with the hash using the given hasher.
+func CompareSHAHelper(hasher string, raw []byte, hash []byte) error {
 	var sha []byte
 
 	switch hasher {
@@ -518,10 +602,11 @@ func compareCryptHelper(password []byte, hash string) error {
 	return errors.WithStack(ErrMismatchedHashAndPassword)
 }
 
+var regexSSHA = regexp.MustCompile(`\{([^}]*)\}`)
+
 // decodeSSHAHash decodes SSHA[1|256|512] encoded password hash in usual {SSHA...} format.
 func decodeSSHAHash(encodedHash string) (hasher string, salt, hash []byte, err error) {
-	re := regexp.MustCompile(`\{([^}]*)\}`)
-	match := re.FindStringSubmatch(string(encodedHash))
+	match := regexSSHA.FindStringSubmatch(string(encodedHash))
 
 	var index_of_salt_begin int
 	var index_of_hash_begin int
@@ -583,7 +668,7 @@ func decodeFirebaseScryptHash(encodedHash string) (p *Scrypt, salt, saltSeparato
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
-	p.SaltLength = uint32(len(salt))
+	p.SaltLength = uint32(len(salt)) // #nosec G115 -- salt would need to be 2^32 bytes long to overflow uint32
 
 	hash, err = base64.StdEncoding.Strict().DecodeString(parts[4])
 	if err != nil {

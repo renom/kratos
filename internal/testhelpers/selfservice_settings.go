@@ -12,20 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tidwall/gjson"
-
-	kratos "github.com/ory/kratos/internal/httpclient"
-
 	"github.com/gobuffalo/httptest"
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"github.com/urfave/negroni"
 
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/ioutilx"
@@ -112,11 +108,11 @@ func ExpectURL(isAPI bool, api, browser string) string {
 }
 
 func NewSettingsUITestServer(t *testing.T, conf *config.Config) *httptest.Server {
-	router := httprouter.New()
-	router.GET("/settings", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router := http.NewServeMux()
+	router.HandleFunc("GET /settings", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	router.GET("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 	ts := httptest.NewServer(router)
@@ -130,14 +126,14 @@ func NewSettingsUITestServer(t *testing.T, conf *config.Config) *httptest.Server
 }
 
 func NewSettingsUIEchoServer(t *testing.T, reg *driver.RegistryDefault) *httptest.Server {
-	router := httprouter.New()
-	router.GET("/settings", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router := http.NewServeMux()
+	router.HandleFunc("GET /settings", func(w http.ResponseWriter, r *http.Request) {
 		res, err := reg.SettingsFlowPersister().GetSettingsFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("flow")))
 		require.NoError(t, err)
 		reg.Writer().Write(w, r, res)
 	})
 
-	router.GET("/login", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 	ts := httptest.NewServer(router)
@@ -175,32 +171,6 @@ func NewSettingsLoginAcceptAPIServer(t *testing.T, publicClient *kratos.APIClien
 	return loginTS
 }
 
-func NewSettingsAPIServer(t *testing.T, reg *driver.RegistryDefault, ids map[string]*identity.Identity) (*httptest.Server, *httptest.Server, map[string]*http.Client) {
-	ctx := context.Background()
-	public, admin := x.NewRouterPublic(), x.NewRouterAdmin()
-	reg.SettingsHandler().RegisterAdminRoutes(admin)
-
-	n := negroni.Classic()
-	n.UseHandler(public)
-	hh := x.NewTestCSRFHandler(n, reg)
-	reg.WithCSRFHandler(hh)
-
-	reg.SettingsHandler().RegisterPublicRoutes(public)
-	reg.SettingsStrategies(context.Background()).RegisterPublicRoutes(public)
-	reg.LoginHandler().RegisterPublicRoutes(public)
-	reg.LoginHandler().RegisterAdminRoutes(admin)
-	reg.LoginStrategies(context.Background()).RegisterPublicRoutes(public)
-
-	tsp, tsa := httptest.NewServer(hh), httptest.NewServer(admin)
-	t.Cleanup(tsp.Close)
-	t.Cleanup(tsa.Close)
-
-	reg.Config().MustSet(ctx, config.ViperKeyPublicBaseURL, tsp.URL)
-	reg.Config().MustSet(ctx, config.ViperKeyAdminBaseURL, tsa.URL)
-	//#nosec G112
-	return tsp, tsa, AddAndLoginIdentities(t, reg, &httptest.Server{Config: &http.Server{Handler: public}, URL: tsp.URL}, ids)
-}
-
 // AddAndLoginIdentities adds the given identities to the store (like a registration flow) and returns http.Clients
 // which contain their sessions.
 func AddAndLoginIdentities(t *testing.T, reg *driver.RegistryDefault, public *httptest.Server, ids map[string]*identity.Identity) map[string]*http.Client {
@@ -212,9 +182,9 @@ func AddAndLoginIdentities(t *testing.T, reg *driver.RegistryDefault, public *ht
 		location := "/sessions/set/" + tid
 
 		if router, ok := public.Config.Handler.(*x.RouterPublic); ok {
-			router.Router.GET(location, route)
-		} else if router, ok := public.Config.Handler.(*httprouter.Router); ok {
 			router.GET(location, route)
+		} else if router, ok := public.Config.Handler.(*http.ServeMux); ok {
+			router.Handle("GET "+location, route)
 		} else if router, ok := public.Config.Handler.(*x.RouterAdmin); ok {
 			router.GET(location, route)
 		} else {
@@ -243,7 +213,7 @@ func SettingsMakeRequest(
 
 	res, err := hc.Do(req)
 	require.NoError(t, err, "action: %s", f.Ui.Action)
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	return string(ioutilx.MustReadAll(res.Body)), res
 }

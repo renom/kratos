@@ -71,7 +71,7 @@ func (s *Strategy) populateLoginMethod(r *http.Request, sr *login.Flow, i *ident
 		return errors.WithStack(err)
 	}
 
-	webAuthCreds := conf.Credentials.ToWebAuthnFiltered(aal)
+	webAuthCreds := conf.Credentials.ToWebAuthnFiltered(aal, nil)
 	if len(webAuthCreds) == 0 {
 		// Identity has no webauthn
 		return webauthnx.ErrNoCredentials
@@ -151,7 +151,7 @@ type updateLoginFlowWithWebAuthnMethod struct {
 }
 
 func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, sess *session.Session) (i *identity.Identity, err error) {
-	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.webauthn.strategy.Login")
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.webauthn.Strategy.Login")
 	defer otelx.End(span, &err)
 
 	if f.Type != flow.TypeBrowser {
@@ -193,7 +193,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 }
 
 func (s *Strategy) loginPasswordless(ctx context.Context, w http.ResponseWriter, r *http.Request, f *login.Flow, p *updateLoginFlowWithWebAuthnMethod) (i *identity.Identity, err error) {
-	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.webauthn.strategy.loginPasswordless")
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.webauthn.Strategy.loginPasswordless")
 	defer otelx.End(span, &err)
 
 	if err := login.CheckAAL(f, identity.AuthenticatorAssuranceLevel1); err != nil {
@@ -250,7 +250,7 @@ func (s *Strategy) loginPasswordless(ctx context.Context, w http.ResponseWriter,
 }
 
 func (s *Strategy) loginAuthenticate(ctx context.Context, r *http.Request, f *login.Flow, identityID uuid.UUID, p *updateLoginFlowWithWebAuthnMethod, aal identity.AuthenticatorAssuranceLevel) (_ *identity.Identity, err error) {
-	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.webauthn.strategy.loginAuthenticate")
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.webauthn.Strategy.loginAuthenticate")
 	defer otelx.End(span, &err)
 
 	i, err := s.d.PrivilegedIdentityPool().GetIdentityConfidential(ctx, identityID)
@@ -283,7 +283,7 @@ func (s *Strategy) loginAuthenticate(ctx context.Context, r *http.Request, f *lo
 		return nil, s.handleLoginError(r, f, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Expected WebAuthN in internal context to be an object but got: %s", err)))
 	}
 
-	webAuthCreds := o.Credentials.ToWebAuthnFiltered(aal)
+	webAuthCreds := o.Credentials.ToWebAuthnFiltered(aal, &webAuthnResponse.Response.AuthenticatorData.Flags)
 	if f.IsRefresh() {
 		webAuthCreds = o.Credentials.ToWebAuthn()
 	}
@@ -335,7 +335,7 @@ func (s *Strategy) populateLoginMethodRefresh(r *http.Request, sr *login.Flow) e
 	return nil
 }
 
-func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, sr *login.Flow) error {
+func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, sr *login.Flow, _ *session.Session) error {
 	return s.populateLoginMethodRefresh(r, sr)
 }
 
@@ -348,7 +348,7 @@ func (s *Strategy) PopulateLoginMethodFirstFactor(r *http.Request, sr *login.Flo
 		return nil
 	}
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := sr.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -364,7 +364,9 @@ func (s *Strategy) PopulateLoginMethodFirstFactor(r *http.Request, sr *login.Flo
 		node.DefaultGroup,
 		node.InputAttributeTypeText,
 		node.WithRequiredInputAttribute,
-		func(attributes *node.InputAttributes) { attributes.Autocomplete = "username webauthn" },
+		func(attributes *node.InputAttributes) {
+			attributes.Autocomplete = node.InputAttributeAutocompleteUsernameWebauthn
+		},
 	).WithMetaLabel(identifierLabel))
 
 	if err := s.populateLoginMethodForPasswordless(r, sr); errors.Is(err, webauthnx.ErrNoCredentials) {

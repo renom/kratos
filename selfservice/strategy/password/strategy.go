@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/go-playground/validator/v10"
 	"github.com/pkg/errors"
 
@@ -37,8 +39,8 @@ var (
 type registrationStrategyDependencies interface {
 	x.LoggingProvider
 	x.WriterProvider
-	x.CSRFTokenGeneratorProvider
-	x.CSRFProvider
+	nosurfx.CSRFTokenGeneratorProvider
+	nosurfx.CSRFProvider
 	x.HTTPClientProvider
 	x.TracingProvider
 	jsonnetsecure.VMProvider
@@ -80,9 +82,9 @@ type Strategy struct {
 	hd *decoderx.HTTP
 }
 
-func NewStrategy(d any) *Strategy {
+func NewStrategy(d registrationStrategyDependencies) *Strategy {
 	return &Strategy{
-		d:  d.(registrationStrategyDependencies),
+		d:  d,
 		v:  validator.New(),
 		hd: decoderx.NewHTTP(),
 	}

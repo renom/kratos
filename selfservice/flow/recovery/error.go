@@ -7,10 +7,15 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/ory/kratos/x/nosurfx"
+
+	"github.com/gofrs/uuid"
+
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/x/events"
 
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
 
 	"github.com/ory/kratos/ui/node"
@@ -37,7 +42,7 @@ type (
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
-		x.CSRFTokenGeneratorProvider
+		nosurfx.CSRFTokenGeneratorProvider
 		config.Provider
 		StrategyProvider
 
@@ -73,12 +78,12 @@ func (s *ErrorHandler) WriteFlowError(
 		Info("Encountered self-service recovery error.")
 
 	if f == nil {
-		trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), "", ""))
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), uuid.Nil, "", "", recoveryErr))
 		s.forward(w, r, nil, recoveryErr)
 		return
 	}
 
-	trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), string(f.Type), f.Active.String()))
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), recoveryErr))
 
 	if expiredError := new(flow.ExpiredError); errors.As(recoveryErr, &expiredError) {
 		strategy, err := s.d.RecoveryStrategies(r.Context()).Strategy(f.Active.String())
@@ -118,6 +123,8 @@ func (s *ErrorHandler) WriteFlowError(
 				http.Redirect(w, r, newFlow.AppendTo(s.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String(), http.StatusSeeOther)
 			}
 		} else {
+			trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "no_continue_with_transition_recovery_error_handler"))
+
 			// We need to use the new flow, as that flow will be a browser flow. Bug fix for:
 			//
 			// https://github.com/ory/kratos/issues/2049!!

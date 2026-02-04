@@ -4,16 +4,15 @@
 package courier
 
 import (
-	"fmt"
 	"net/http"
+
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
 
 	"github.com/gofrs/uuid"
 
 	"github.com/ory/herodot"
-	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/pagination/migrationpagination"
-
-	"github.com/julienschmidt/httprouter"
+	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/x"
@@ -22,14 +21,14 @@ import (
 const (
 	AdminRouteCourier      = "/courier"
 	AdminRouteListMessages = AdminRouteCourier + "/messages"
-	AdminRouteGetMessage   = AdminRouteCourier + "/messages/:msgID"
+	AdminRouteGetMessage   = AdminRouteCourier + "/messages/{msgID}"
 )
 
 type (
 	handlerDependencies interface {
 		x.WriterProvider
 		x.LoggingProvider
-		x.CSRFProvider
+		nosurfx.CSRFProvider
 		PersistenceProvider
 		config.Provider
 	}
@@ -47,8 +46,8 @@ func NewHandler(r handlerDependencies) *Handler {
 
 func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	h.r.CSRFHandler().IgnoreGlobs(x.AdminPrefix+AdminRouteListMessages, AdminRouteListMessages)
-	public.GET(x.AdminPrefix+AdminRouteListMessages, x.RedirectToAdminRoute(h.r))
-	public.GET(x.AdminPrefix+AdminRouteGetMessage, x.RedirectToAdminRoute(h.r))
+	public.GET(x.AdminPrefix+AdminRouteListMessages, redir.RedirectToAdminRoute(h.r))
+	public.GET(x.AdminPrefix+AdminRouteGetMessage, redir.RedirectToAdminRoute(h.r))
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
@@ -63,7 +62,7 @@ func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
 //nolint:deadcode,unused
 //lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
 type listCourierMessagesResponse struct {
-	migrationpagination.ResponseHeaderAnnotation
+	keysetpagination.ResponseHeaders
 
 	// List of identities
 	//
@@ -110,14 +109,15 @@ type ListCourierMessagesParameters struct {
 //	  200: listCourierMessages
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) listCourierMessages(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	filter, paginator, err := parseMessagesFilter(r)
+func (h *Handler) listCourierMessages(w http.ResponseWriter, r *http.Request) {
+	keys := h.r.Config().SecretsPagination(r.Context())
+	filter, paginator, err := parseMessagesFilter(r, keys)
 	if err != nil {
 		h.r.Writer().WriteErrorCode(w, r, http.StatusBadRequest, err)
 		return
 	}
 
-	l, tc, nextPage, err := h.r.CourierPersister().ListMessages(r.Context(), filter, paginator)
+	l, nextPage, err := h.r.CourierPersister().ListMessages(r.Context(), filter, paginator)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
@@ -129,13 +129,12 @@ func (h *Handler) listCourierMessages(w http.ResponseWriter, r *http.Request, _ 
 		}
 	}
 
-	w.Header().Set("X-Total-Count", fmt.Sprint(tc))
 	u := *r.URL
-	keysetpagination.Header(w, &u, nextPage)
+	keysetpagination.SetLinkHeader(w, keys, &u, nextPage)
 	h.r.Writer().Write(w, r, l)
 }
 
-func parseMessagesFilter(r *http.Request) (ListCourierMessagesParameters, []keysetpagination.Option, error) {
+func parseMessagesFilter(r *http.Request, keys [][32]byte) (ListCourierMessagesParameters, []keysetpagination.Option, error) {
 	var status *MessageStatus
 
 	if r.URL.Query().Has("status") {
@@ -147,7 +146,7 @@ func parseMessagesFilter(r *http.Request) (ListCourierMessagesParameters, []keys
 		status = &ms
 	}
 
-	opts, err := keysetpagination.Parse(r.URL.Query(), keysetpagination.NewMapPageToken)
+	opts, err := keysetpagination.ParseQueryParams(keys, r.URL.Query())
 	if err != nil {
 		return ListCourierMessagesParameters{}, nil, err
 	}
@@ -190,10 +189,10 @@ type getCourierMessage struct {
 //		200: message
 //		400: errorGeneric
 //		default: errorGeneric
-func (h *Handler) getCourierMessage(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	msgID, err := uuid.FromString(ps.ByName("msgID"))
+func (h *Handler) getCourierMessage(w http.ResponseWriter, r *http.Request) {
+	msgID, err := uuid.FromString(r.PathValue("msgID"))
 	if err != nil {
-		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest.WithError(err.Error()).WithDebugf("could not parse parameter {id} as UUID, got %s", ps.ByName("id")))
+		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest.WithError(err.Error()).WithDebugf("could not parse parameter {id} as UUID, got %s", r.PathValue("id")))
 		return
 	}
 

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -19,7 +21,6 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
-	"github.com/ory/kratos/x"
 	"github.com/ory/nosurf"
 )
 
@@ -58,7 +59,7 @@ func EnsureCSRF(
 		// https://developers.cloudflare.com/fundamentals/reference/policies-compliances/cloudflare-cookies/
 		var cookies []string
 		for _, c := range r.Cookies() {
-			if !(strings.HasPrefix(c.Name, "__cf") || strings.HasPrefix(c.Name, "_cf") || strings.HasPrefix(c.Name, "cf_")) {
+			if !strings.HasPrefix(c.Name, "__cf") && !strings.HasPrefix(c.Name, "_cf") && !strings.HasPrefix(c.Name, "cf_") {
 				cookies = append(cookies, c.Name)
 			}
 		}
@@ -70,7 +71,7 @@ func EnsureCSRF(
 		return nil
 	default:
 		if !nosurf.VerifyToken(generator(r), actual) {
-			return errors.WithStack(x.CSRFErrorReason(r, reg))
+			return errors.WithStack(nosurfx.CSRFErrorReason(r, reg))
 		}
 	}
 

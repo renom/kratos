@@ -7,6 +7,13 @@ import (
 	"net/http"
 	"net/url"
 
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/otelx"
+
+	"github.com/gofrs/uuid"
+
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/x/events"
@@ -33,8 +40,9 @@ type (
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
-		x.CSRFProvider
-		x.CSRFTokenGeneratorProvider
+		x.TracingProvider
+		nosurfx.CSRFProvider
+		nosurfx.CSRFTokenGeneratorProvider
 		config.Provider
 		FlowPersistenceProvider
 		StrategyProvider
@@ -60,6 +68,13 @@ func (s *ErrorHandler) WriteFlowError(
 	group node.UiNodeGroup,
 	err error,
 ) {
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.verification.ErrorHandler.WriteFlowError",
+		trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+	r = r.WithContext(ctx)
+	defer otelx.End(span, &err)
+
 	logger := s.d.Audit().
 		WithError(err).
 		WithRequest(r).
@@ -69,11 +84,12 @@ func (s *ErrorHandler) WriteFlowError(
 		Info("Encountered self-service verification error.")
 
 	if f == nil {
-		trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), "", ""))
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), uuid.Nil, "", "", err))
 		s.forward(w, r, nil, err)
 		return
 	}
-	trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), string(f.Type), f.Active.String()))
+	span.SetAttributes(attribute.String("flow_id", f.ID.String()))
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), err))
 
 	if e := new(flow.ExpiredError); errors.As(err, &e) {
 		strategy, err := s.d.VerificationStrategies(r.Context()).Strategy(f.Active.String())

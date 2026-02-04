@@ -13,14 +13,6 @@ import (
 	"testing"
 	"time"
 
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	"github.com/ory/nosurf"
-	"github.com/ory/x/urlx"
-
-	"github.com/ory/kratos/driver"
-
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -30,6 +22,10 @@ import (
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/nosurf"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/urlx"
 )
 
 var _ nosurf.Handler = new(mockCSRFHandler)
@@ -38,46 +34,53 @@ type mockCSRFHandler struct {
 	c int
 }
 
-func (f *mockCSRFHandler) DisablePath(s string) {
-}
+func (f *mockCSRFHandler) DisablePath(string)                           {}
+func (f *mockCSRFHandler) DisableGlob(string)                           {}
+func (f *mockCSRFHandler) DisableGlobs(...string)                       {}
+func (f *mockCSRFHandler) IgnoreGlob(string)                            {}
+func (f *mockCSRFHandler) IgnoreGlobs(...string)                        {}
+func (f *mockCSRFHandler) ExemptPath(string)                            {}
+func (f *mockCSRFHandler) IgnorePath(string)                            {}
+func (f *mockCSRFHandler) ServeHTTP(http.ResponseWriter, *http.Request) {}
 
-func (f *mockCSRFHandler) DisableGlob(s string) {
-}
-
-func (f *mockCSRFHandler) DisableGlobs(s ...string) {
-}
-
-func (f *mockCSRFHandler) IgnoreGlob(s string) {
-}
-
-func (f *mockCSRFHandler) IgnoreGlobs(s ...string) {
-}
-
-func (f *mockCSRFHandler) ExemptPath(s string) {}
-
-func (f *mockCSRFHandler) IgnorePath(s string) {}
-
-func (f *mockCSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-}
-
-func (f *mockCSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) string {
+func (f *mockCSRFHandler) RegenerateToken(_ http.ResponseWriter, _ *http.Request) string {
 	f.c++
-	return x.FakeCSRFToken
+	return nosurfx.FakeCSRFToken
 }
 
-func createAAL2Identity(t *testing.T, reg driver.Registry) *identity.Identity {
-	idAAL2 := identity.Identity{Traits: []byte("{}"), State: identity.StateActive, Credentials: map[identity.CredentialsType]identity.Credentials{
-		identity.CredentialsTypePassword: {Type: identity.CredentialsTypePassword, Config: []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`), Identifiers: []string{testhelpers.RandomEmail()}},
-		identity.CredentialsTypeWebAuthn: {Type: identity.CredentialsTypeWebAuthn, Config: []byte(`{"credentials":[{"is_passwordless":false}]}`), Identifiers: []string{testhelpers.RandomEmail()}},
-	}}
-	return &idAAL2
+func newAAL2Identity() *identity.Identity {
+	return &identity.Identity{
+		SchemaID: "default",
+		Traits:   []byte("{}"),
+		State:    identity.StateActive,
+		Credentials: map[identity.CredentialsType]identity.Credentials{
+			identity.CredentialsTypePassword: {
+				Type:        identity.CredentialsTypePassword,
+				Config:      []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`),
+				Identifiers: []string{testhelpers.RandomEmail()},
+			},
+			identity.CredentialsTypeWebAuthn: {
+				Type:        identity.CredentialsTypeWebAuthn,
+				Config:      []byte(`{"credentials":[{"is_passwordless":false}]}`),
+				Identifiers: []string{testhelpers.RandomEmail()},
+			},
+		},
+	}
 }
 
-func createAAL1Identity(t *testing.T, reg driver.Registry) *identity.Identity {
-	idAAL1 := identity.Identity{Traits: []byte("{}"), State: identity.StateActive, Credentials: map[identity.CredentialsType]identity.Credentials{
-		identity.CredentialsTypePassword: {Type: identity.CredentialsTypePassword, Config: []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`), Identifiers: []string{testhelpers.RandomEmail()}},
-	}}
-	return &idAAL1
+func newAAL1Identity() *identity.Identity {
+	return &identity.Identity{
+		SchemaID: "default",
+		Traits:   []byte("{}"),
+		State:    identity.StateActive,
+		Credentials: map[identity.CredentialsType]identity.Credentials{
+			identity.CredentialsTypePassword: {
+				Type:        identity.CredentialsTypePassword,
+				Config:      []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`),
+				Identifiers: []string{testhelpers.RandomEmail()},
+			},
+		},
+	}
 }
 
 func TestManagerHTTP(t *testing.T) {
@@ -183,7 +186,6 @@ func TestManagerHTTP(t *testing.T) {
 		actualIdentity, err := reg.IdentityPool().GetIdentity(ctx, i.ID, identity.ExpandNothing)
 		require.NoError(t, err)
 		assert.EqualValues(t, identity.AuthenticatorAssuranceLevel1, actualIdentity.InternalAvailableAAL.String)
-
 	})
 
 	t.Run("suite=SessionAddAuthenticationMethod", func(t *testing.T) {
@@ -223,18 +225,18 @@ func TestManagerHTTP(t *testing.T) {
 		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/fake-session.schema.json")
 
 		var s *session.Session
-		rp := x.NewRouterPublic()
-		rp.GET("/session/revoke", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		rp := x.NewRouterPublic(reg)
+		rp.GET("/session/revoke", func(w http.ResponseWriter, r *http.Request) {
 			require.NoError(t, reg.SessionManager().PurgeFromRequest(r.Context(), w, r))
 			w.WriteHeader(http.StatusOK)
 		})
 
-		rp.GET("/session/set", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		rp.GET("/session/set", func(w http.ResponseWriter, r *http.Request) {
 			require.NoError(t, reg.SessionManager().UpsertAndIssueCookie(r.Context(), w, r, s))
 			w.WriteHeader(http.StatusOK)
 		})
 
-		rp.GET("/session/get", func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+		rp.GET("/session/get", func(w http.ResponseWriter, r *http.Request) {
 			sess, err := reg.SessionManager().FetchFromRequest(r.Context(), r)
 			if err != nil {
 				t.Logf("Got error on lookup: %s %T", err, errors.Unwrap(err))
@@ -244,7 +246,17 @@ func TestManagerHTTP(t *testing.T) {
 			reg.Writer().Write(w, r, sess)
 		})
 
-		pts := httptest.NewServer(x.NewTestCSRFHandler(rp, reg))
+		rp.GET("/session/get-middleware", reg.SessionHandler().IsAuthenticated(func(w http.ResponseWriter, r *http.Request) {
+			sess, err := reg.SessionManager().FetchFromRequestContext(r.Context(), r)
+			if err != nil {
+				t.Logf("Got error on lookup: %s %T", err, errors.Unwrap(err))
+				reg.Writer().WriteError(w, r, err)
+				return
+			}
+			reg.Writer().Write(w, r, sess)
+		}, session.RedirectOnUnauthenticated("https://failed.com")))
+
+		pts := httptest.NewServer(nosurfx.NewTestCSRFHandler(rp, reg))
 		t.Cleanup(pts.Close)
 		conf.MustSet(ctx, config.ViperKeyPublicBaseURL, pts.URL)
 		reg.RegisterPublicRoutes(context.Background(), rp)
@@ -261,6 +273,10 @@ func TestManagerHTTP(t *testing.T) {
 			testhelpers.MockHydrateCookieClient(t, c, pts.URL+"/session/set")
 
 			res, err := c.Get(pts.URL + "/session/get")
+			require.NoError(t, err)
+			assert.EqualValues(t, http.StatusOK, res.StatusCode)
+
+			res, err = c.Get(pts.URL + "/session/get-middleware")
 			require.NoError(t, err)
 			assert.EqualValues(t, http.StatusOK, res.StatusCode)
 		})
@@ -299,7 +315,7 @@ func TestManagerHTTP(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySessionName, "")
 			})
 
-			rp.GET("/session/set/invalid", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+			rp.GET("/session/set/invalid", func(w http.ResponseWriter, r *http.Request) {
 				require.Error(t, reg.SessionManager().UpsertAndIssueCookie(r.Context(), w, r, s))
 				w.WriteHeader(http.StatusInternalServerError)
 			})
@@ -408,9 +424,9 @@ func TestManagerHTTP(t *testing.T) {
 						s.CompletedLoginFor(m, "")
 					}
 					require.NoError(t, reg.SessionManager().ActivateSession(req, s, i, time.Now().UTC()))
-					err := reg.SessionManager().DoesSessionSatisfy((&http.Request{}).WithContext(context.Background()), s, requested)
+					err := reg.SessionManager().DoesSessionSatisfy(ctx, s, requested)
 					if expectedError != nil {
-						require.ErrorAs(t, err, &expectedError)
+						assert.EqualExportedValues(t, expectedError, err)
 					} else {
 						require.NoError(t, err)
 					}
@@ -422,7 +438,10 @@ func TestManagerHTTP(t *testing.T) {
 					})
 
 					t.Run("rejected for aal1 if identity has aal2", func(t *testing.T) {
-						run(t, []identity.CredentialsType{identity.CredentialsTypePassword}, config.HighestAvailableAAL, idAAL2, session.NewErrAALNotSatisfied(""))
+						returnURL := urlx.AppendPaths(reg.Config().SelfPublicURL(ctx), "/self-service/login/browser")
+						returnURL.RawQuery = "aal=aal2"
+						run(t, []identity.CredentialsType{identity.CredentialsTypePassword}, config.HighestAvailableAAL, idAAL2,
+							session.NewErrAALNotSatisfied(returnURL.String()))
 					})
 
 					t.Run("fulfilled for aal1 if identity has aal2 but config is aal1", func(t *testing.T) {
@@ -439,8 +458,8 @@ func TestManagerHTTP(t *testing.T) {
 				}
 
 				t.Run("identity available AAL is not hydrated", func(t *testing.T) {
-					idAAL2 := createAAL2Identity(t, reg)
-					idAAL1 := createAAL1Identity(t, reg)
+					idAAL2 := newAAL2Identity()
+					idAAL1 := newAAL1Identity()
 					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), idAAL1))
 					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), idAAL2))
 					test(t, idAAL1, idAAL2)
@@ -449,13 +468,13 @@ func TestManagerHTTP(t *testing.T) {
 				t.Run("identity available AAL is hydrated and updated in the DB", func(t *testing.T) {
 					// We do not create the identity in the database, proving that we do not need
 					// to do any DB roundtrips in this case.
-					idAAL1 := createAAL2Identity(t, reg)
+					idAAL1 := newAAL2Identity()
 					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), idAAL1))
 
 					s := session.NewInactiveSession()
 					s.CompletedLoginFor(identity.CredentialsTypePassword, "")
 					require.NoError(t, reg.SessionManager().ActivateSession(req, s, idAAL1, time.Now().UTC()))
-					require.Error(t, reg.SessionManager().DoesSessionSatisfy((&http.Request{}).WithContext(context.Background()), s, config.HighestAvailableAAL, session.UpsertAAL))
+					require.Error(t, reg.SessionManager().DoesSessionSatisfy(ctx, s, config.HighestAvailableAAL, session.UpsertAAL))
 
 					result, err := reg.IdentityPool().GetIdentity(context.Background(), idAAL1.ID, identity.ExpandNothing)
 					require.NoError(t, err)
@@ -465,10 +484,10 @@ func TestManagerHTTP(t *testing.T) {
 				t.Run("identity available AAL is hydrated without DB", func(t *testing.T) {
 					// We do not create the identity in the database, proving that we do not need
 					// to do any DB roundtrips in this case.
-					idAAL2 := createAAL2Identity(t, reg)
+					idAAL2 := newAAL2Identity()
 					idAAL2.InternalAvailableAAL = identity.NewNullableAuthenticatorAssuranceLevel(identity.AuthenticatorAssuranceLevel2)
 
-					idAAL1 := createAAL1Identity(t, reg)
+					idAAL1 := newAAL1Identity()
 					idAAL1.InternalAvailableAAL = identity.NewNullableAuthenticatorAssuranceLevel(identity.AuthenticatorAssuranceLevel1)
 
 					test(t, idAAL1, idAAL2)
@@ -501,40 +520,47 @@ func TestDoesSessionSatisfy(t *testing.T) {
 		Identifiers: []string{testhelpers.RandomEmail()},
 		Config:      []byte(`{"address_type":"email","used_at":{"Time":"0001-01-01T00:00:00Z","Valid":false}}`),
 	}
-	//codeEmpty := identity.Credentials{
-	//	Type:        identity.CredentialsTypeCodeAuth,
-	//	Identifiers: []string{testhelpers.RandomEmail()},
-	//	Config:      []byte(`{}`),
-	//}
+
+	codeV2 := identity.Credentials{
+		Type:        identity.CredentialsTypeCodeAuth,
+		Identifiers: []string{testhelpers.RandomEmail()},
+		Config:      []byte(`{"addresses":[{"channel":"email","address":"test@ory.sh"}]}`),
+	}
+
+	codeEmpty := identity.Credentials{
+		Type:        identity.CredentialsTypeCodeAuth,
+		Identifiers: []string{},
+		Config:      []byte(`{}`),
+	}
 
 	oidc := identity.Credentials{
 		Type:        identity.CredentialsTypeOIDC,
 		Config:      []byte(`{"providers":[{"subject":"0.fywegkf7hd@ory.sh","provider":"hydra","initial_id_token":"65794a68624763694f694a53557a49314e694973496d74705a434936496e4231596d7870597a706f6557527959533576634756756157517561575174644739725a5734694c434a30655841694f694a4b5631516966512e65794a686446396f59584e6f496a6f6956484650616b6f324e6c397a613046436555643662315679576b466655534973496d46315a43493657794a72636d463062334d74593278705a573530496c3073496d46316447686664476c745a5349364d5459304e6a55314e6a59784e4377695a586877496a6f784e6a51324e5459774d6a45314c434a70595851694f6a45324e4459314e5459324d545573496d6c7a63794936496d6830644841364c79397362324e6862476876633351364e4451304e4338694c434a7164476b694f694a6a596a4d784d6a51794e6930314e7a4d774c5451314d546374596a51335a53316b4d446379596a51334d6a6b344d4759694c434a79595851694f6a45324e4459314e5459324d544d73496e4e705a434936496a677a4e5755344e47526a4c5463344d544d744e4749324f4330354d544a6d4c5446684d7a646d4e444d354d4463304e534973496e4e3159694936496a41755a6e6c335a5764725a6a646f5a454276636e6b75633267694c434a335a574a7a6158526c496a6f696148523063484d364c7939336433637562334a354c6e4e6f4c794a392e506850623770456358544c3456647730427959686f30794a7232714b794b4f7373646c4b6c74716b4953693762414e58776a7635686538506e6d7a586e713538556f5739657754584a485a33425651614d4e79612d755f5933584a4a61665673543347476c52776f376f5261707a6a564836502d72447657385649524d5361356f783242397164416d796659505734376e56782d4e68787247564c56464b526b5866324e4448534e6d435968524963455539724331366235385331344c314367776972624d507662797870644c63764f4a4546554238324c794574525a786f644748354c69394d6b5f4d6137363969583254776758434179306734475a625957337137317466574c37736d5342394669785076434b6a3738433753546b762d764f737a4e6533523864676133775471466e6253797a6a614f4b47626e424a4a77423869306e416c48496d425337587146645f666d556d4e62377a372d63716e593374395069306248466b46596e6746545279664d4c6f466f576956784842704b4d6c6b304d4e7a5155414e5368546e346769544d5547454a4f6372346f6f445f6770344768734c44542d54465f6f73486c304832544237777a6d546d735f3150506547424e716a316b61576a467038567247726e4a6b354f594c643152473152464c794535544c4d47315f62744762447137334450784c334b3657387348507242504b654133344377373371584e5247724e73574e69496e775f4e596a65554d484b6351436c4e51445a49725339794962456a485a78476a34546e4367664f5974694e76527a4c6c36616a73614265464b7a45592d6348416e6e42694c75744439373168697241684f5463544a42783672716f67717764755356726551456f565a5735616e4a7a7575775234685453354d44314d64457045437471526d416c71555459644e5a365778514d","initial_access_token":"52344752743736552d634a2d4a2d424372447159634967464652446c6455455a6a526e534d62336e3242732e47324f444d64303544774b4e67395649476e306e496b3877324e72444f48384a78635042635a4a58336d63","initial_refresh_token":"327872337a4d382d654273674b6d61644a624e5a497572473374545154615070313264514a314476544d632e77326d34747a6e7950584c38324b794563716468685068635156314f77386a535a345355496f3544744a51"}]}`),
 		Identifiers: []string{"hydra:0.fywegkf7hd@ory.sh"},
 	}
-	//oidcEmpty := identity.Credentials{
+	// oidcEmpty := identity.Credentials{
 	//	Type:        identity.CredentialsTypeOIDC,
 	//	Config:      []byte(`{}`),
 	//	Identifiers: []string{"hydra:0.fywegkf7hd@ory.sh"},
-	//}
+	// }
 
 	lookupSecrets := identity.Credentials{
 		Type:   identity.CredentialsTypeLookup,
 		Config: []byte(`{"recovery_codes": [{"code": "abcde", "used_at": null}]}`),
 	}
-	//lookupSecretsEmpty := identity.Credentials{
+	// lookupSecretsEmpty := identity.Credentials{
 	//	Type:   identity.CredentialsTypeLookup,
 	//	Config: []byte(`{}`),
-	//}
+	// }
 
 	totp := identity.Credentials{
 		Type:   identity.CredentialsTypeTOTP,
 		Config: []byte(`{"totp_url": "otpauth://totp/..."}`),
 	}
-	//totpEmpty := identity.Credentials{
+	// totpEmpty := identity.Credentials{
 	//	Type:   identity.CredentialsTypeTOTP,
 	//	Config: []byte(`{}`),
-	//}
+	// }
 
 	// passkey
 	passkey := identity.Credentials{ // passkey
@@ -542,11 +568,11 @@ func TestDoesSessionSatisfy(t *testing.T) {
 		Config:      []byte(`{"credentials":[{}]}`),
 		Identifiers: []string{testhelpers.RandomEmail()},
 	}
-	//passkeyEmpty := identity.Credentials{ // passkey
+	// passkeyEmpty := identity.Credentials{ // passkey
 	//	Type:        identity.CredentialsTypePasskey,
 	//	Config:      []byte(`{"credentials":null}`),
 	//	Identifiers: []string{testhelpers.RandomEmail()},
-	//}
+	// }
 
 	// webAuthn
 	mfaWebAuth := identity.Credentials{
@@ -590,7 +616,7 @@ func TestDoesSessionSatisfy(t *testing.T) {
 			creds:   []identity.Credentials{passwordMigration},
 			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypePassword]},
 			withContext: func(t *testing.T, ctx context.Context) context.Context {
-				return confighelpers.WithConfigValues(ctx, map[string]any{
+				return contextx.WithConfigValues(ctx, map[string]any{
 					"selfservice.methods.password_migration.enabled": true,
 				})
 			},
@@ -603,7 +629,7 @@ func TestDoesSessionSatisfy(t *testing.T) {
 			creds:   []identity.Credentials{passwordMigration},
 			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypePassword]},
 			withContext: func(t *testing.T, ctx context.Context) context.Context {
-				return confighelpers.WithConfigValues(ctx, map[string]any{
+				return contextx.WithConfigValues(ctx, map[string]any{
 					"selfservice.methods.password_migration.enabled": false,
 				})
 			},
@@ -614,6 +640,38 @@ func TestDoesSessionSatisfy(t *testing.T) {
 			matcher: config.HighestAvailableAAL,
 			creds:   []identity.Credentials{code},
 			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypeCodeAuth]},
+			// No error
+		},
+		{
+			desc:    "with highest_available a otp codeV2 user is aal1",
+			matcher: config.HighestAvailableAAL,
+			creds:   []identity.Credentials{codeV2},
+			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypeCodeAuth]},
+			// No error
+		},
+		{
+			desc:    "with highest_available a empty mfa code user is aal1",
+			matcher: config.HighestAvailableAAL,
+			creds:   []identity.Credentials{codeEmpty},
+			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypeCodeAuth]},
+			withContext: func(t *testing.T, ctx context.Context) context.Context {
+				return contextx.WithConfigValues(ctx, map[string]any{
+					"selfservice.methods.code.mfa_enabled": true,
+				})
+			},
+			// No error
+		},
+		{
+			desc:    "with highest_available a password user with empty mfa code is aal1",
+			matcher: config.HighestAvailableAAL,
+			creds:   []identity.Credentials{password, codeEmpty},
+			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypePassword]},
+			withContext: func(t *testing.T, ctx context.Context) context.Context {
+				return contextx.WithConfigValues(ctx, map[string]any{
+					"selfservice.methods.code.passwordless_enabled": false,
+					"selfservice.methods.code.mfa_enabled":          true,
+				})
+			},
 			// No error
 		},
 		{
@@ -676,10 +734,23 @@ func TestDoesSessionSatisfy(t *testing.T) {
 		{
 			desc:    "with highest_available a recovery link user requires aal2 if they have 2fa code configured",
 			matcher: config.HighestAvailableAAL,
-			creds:   []identity.Credentials{},
+			creds:   []identity.Credentials{code},
 			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypeRecoveryLink]},
 			withContext: func(t *testing.T, ctx context.Context) context.Context {
-				return confighelpers.WithConfigValues(ctx, map[string]any{
+				return contextx.WithConfigValues(ctx, map[string]any{
+					"selfservice.methods.code.passwordless_enabled": false,
+					"selfservice.methods.code.mfa_enabled":          true,
+				})
+			},
+			errIs: new(session.ErrAALNotSatisfied),
+		},
+		{
+			desc:    "with highest_available a recovery link user requires aal2 if they have 2fa code v2 configured",
+			matcher: config.HighestAvailableAAL,
+			creds:   []identity.Credentials{codeV2},
+			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypeRecoveryLink]},
+			withContext: func(t *testing.T, ctx context.Context) context.Context {
+				return contextx.WithConfigValues(ctx, map[string]any{
 					"selfservice.methods.code.passwordless_enabled": false,
 					"selfservice.methods.code.mfa_enabled":          true,
 				})
@@ -753,7 +824,20 @@ func TestDoesSessionSatisfy(t *testing.T) {
 			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypePassword]},
 			errAs:   new(session.ErrAALNotSatisfied),
 			withContext: func(t *testing.T, ctx context.Context) context.Context {
-				return confighelpers.WithConfigValues(ctx, map[string]any{
+				return contextx.WithConfigValues(ctx, map[string]any{
+					"selfservice.methods.code.passwordless_enabled": false,
+					"selfservice.methods.code.mfa_enabled":          true,
+				})
+			},
+		},
+		{
+			desc:    "has=aal1, requested=highest, available=aal2, credential=password+codeV2-mfa",
+			matcher: config.HighestAvailableAAL,
+			creds:   []identity.Credentials{password, codeV2},
+			withAMR: session.AuthenticationMethods{amrs[identity.CredentialsTypePassword]},
+			errAs:   new(session.ErrAALNotSatisfied),
+			withContext: func(t *testing.T, ctx context.Context) context.Context {
+				return contextx.WithConfigValues(ctx, map[string]any{
 					"selfservice.methods.code.passwordless_enabled": false,
 					"selfservice.methods.code.mfa_enabled":          true,
 				})
@@ -858,7 +942,7 @@ func TestDoesSessionSatisfy(t *testing.T) {
 			}
 			require.NoError(t, reg.SessionManager().ActivateSession(req, s, id, time.Now().UTC()))
 
-			err := reg.SessionManager().DoesSessionSatisfy((&http.Request{}).WithContext(ctx), s, string(tc.matcher), tc.sessionManagerOptions...)
+			err := reg.SessionManager().DoesSessionSatisfy(ctx, s, string(tc.matcher), tc.sessionManagerOptions...)
 			if tc.errAs != nil || tc.errIs != nil {
 				if tc.expectedFunc != nil {
 					tc.expectedFunc(t, err, tc.errAs)
@@ -875,27 +959,38 @@ func TestDoesSessionSatisfy(t *testing.T) {
 
 			// This should still work even if the session does not have identity data attached yet ...
 			s.Identity = nil
-			err = reg.SessionManager().DoesSessionSatisfy((&http.Request{}).WithContext(ctx), s, string(tc.matcher), tc.sessionManagerOptions...)
+			err = reg.SessionManager().DoesSessionSatisfy(ctx, s, string(tc.matcher), tc.sessionManagerOptions...)
 			if tc.errAs != nil {
 				if tc.expectedFunc != nil {
-					tc.expectedFunc(t, err, tc.errAs)
+					// If there is no identity, we can't expect the error to contain the identity
+					// schema in the RedirectTo URL.
+					var errAALNotSatisfied *session.ErrAALNotSatisfied
+					errors.As(tc.errAs, &errAALNotSatisfied)
+					u := x.Must(url.Parse(errAALNotSatisfied.RedirectTo))
+					q := u.Query()
+					q.Del("identity_schema")
+					u.RawQuery = q.Encode()
+
+					tc.expectedFunc(t, err, session.NewErrAALNotSatisfied(u.String()))
+				} else {
+					assert.ErrorAs(t, err, &tc.errAs)
 				}
-				require.ErrorAs(t, err, &tc.errAs)
 			} else {
-				require.NoError(t, err)
+				assert.NoError(t, err)
 			}
 
 			// ... or no credentials attached.
 			s.Identity = id
 			s.Identity.Credentials = nil
-			err = reg.SessionManager().DoesSessionSatisfy((&http.Request{}).WithContext(ctx), s, string(tc.matcher), tc.sessionManagerOptions...)
+			err = reg.SessionManager().DoesSessionSatisfy(ctx, s, string(tc.matcher), tc.sessionManagerOptions...)
 			if tc.errAs != nil {
 				if tc.expectedFunc != nil {
 					tc.expectedFunc(t, err, tc.errAs)
+				} else {
+					assert.ErrorAs(t, err, &tc.errAs)
 				}
-				require.ErrorAs(t, err, &tc.errAs)
 			} else {
-				require.NoError(t, err)
+				assert.NoError(t, err)
 			}
 		})
 	}

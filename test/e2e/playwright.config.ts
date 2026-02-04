@@ -56,11 +56,10 @@ export default defineConfig({
         COURIER_SMTP_CONNECTION_URI:
           "smtp://localhost:8026/?disable_starttls=true",
       },
-      timeout: 5 * 60 * 1000, // 5 minutes
+      timeout: 7 * 60 * 1000, // 7 minutes
     },
     {
-      command:
-        "make .bin/MailHog && .bin/MailHog -smtp-bind-addr=localhost:8026",
+      command: "go tool MailHog -smtp-bind-addr=localhost:8026",
       cwd: "../..",
       reuseExistingServer: false,
       url: "http://localhost:8025/",

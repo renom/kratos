@@ -6,6 +6,11 @@ package registration
 import (
 	"net/http"
 
+	"github.com/gofrs/uuid"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/ory/x/otelx"
+
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/identity"
@@ -36,6 +41,7 @@ type (
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
+		x.TracingProvider
 		config.Provider
 
 		sessiontokenexchange.PersistenceProvider
@@ -55,22 +61,22 @@ func NewErrorHandler(d errorHandlerDependencies) *ErrorHandler {
 }
 
 func (s *ErrorHandler) PrepareReplacementForExpiredFlow(w http.ResponseWriter, r *http.Request, f *Flow, err error) (*flow.ExpiredError, error) {
-	e := new(flow.ExpiredError)
-	if !errors.As(err, &e) {
+	errExpired := new(flow.ExpiredError)
+	if !errors.As(err, &errExpired) {
 		return nil, nil
 	}
 	// create new flow because the old one is not valid
-	a, err := s.d.RegistrationHandler().FromOldFlow(w, r, *f)
+	newFlow, err := s.d.RegistrationHandler().FromOldFlow(w, r, *f)
 	if err != nil {
 		return nil, err
 	}
 
-	a.UI.Messages.Add(text.NewErrorValidationRegistrationFlowExpired(e.ExpiredAt))
-	if err := s.d.RegistrationFlowPersister().UpdateRegistrationFlow(r.Context(), a); err != nil {
+	newFlow.UI.Messages.Add(text.NewErrorValidationRegistrationFlowExpired(errExpired.ExpiredAt))
+	if err := s.d.RegistrationFlowPersister().UpdateRegistrationFlow(r.Context(), newFlow); err != nil {
 		return nil, err
 	}
 
-	return e.WithFlow(a), nil
+	return errExpired.WithFlow(newFlow), nil
 }
 
 func (s *ErrorHandler) WriteFlowError(
@@ -80,6 +86,13 @@ func (s *ErrorHandler) WriteFlowError(
 	group node.UiNodeGroup,
 	err error,
 ) {
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.registration.ErrorHandler.WriteFlowError",
+		trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+	r = r.WithContext(ctx)
+	defer otelx.End(span, &err)
+
 	if dup := new(identity.ErrDuplicateCredentials); errors.As(err, &dup) {
 		err = schema.NewDuplicateCredentialsError(dup)
 	}
@@ -93,11 +106,12 @@ func (s *ErrorHandler) WriteFlowError(
 		Info("Encountered self-service flow error.")
 
 	if f == nil {
-		trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), "", ""))
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), uuid.Nil, "", "", err))
 		s.forward(w, r, nil, err)
 		return
 	}
-	trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), string(f.Type), f.Active.String()))
+	span.SetAttributes(attribute.String("flow_id", f.ID.String()))
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), err))
 
 	if expired, inner := s.PrepareReplacementForExpiredFlow(w, r, f, err); inner != nil {
 		s.forward(w, r, f, err)
@@ -117,7 +131,7 @@ func (s *ErrorHandler) WriteFlowError(
 		return
 	}
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		s.forward(w, r, f, err)
 		return

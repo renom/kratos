@@ -4,14 +4,26 @@
 package code
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"time"
+
+	"github.com/ory/kratos/x/redir"
+
+	"github.com/ory/x/otelx/semconv"
+	"github.com/ory/x/pointerx"
+	"github.com/ory/x/sqlcon"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/herodot"
 	"github.com/ory/x/decoderx"
@@ -34,12 +46,31 @@ func (s *Strategy) RecoveryStrategyID() string {
 	return string(recovery.RecoveryStrategyCode)
 }
 
+// This builds the initial UI (first recovery screen).
 func (s *Strategy) PopulateRecoveryMethod(r *http.Request, f *recovery.Flow) error {
-	f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
-	f.UI.GetNodes().Upsert(
-		node.NewInputField("email", nil, node.CodeGroup, node.InputAttributeTypeEmail, node.WithRequiredInputAttribute).
-			WithMetaLabel(text.NewInfoNodeInputEmail()),
-	)
+	switch f.State {
+	case flow.StateChooseMethod:
+		f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
+		f.UI.GetNodes().Upsert(
+			node.NewInputField("email", nil, node.CodeGroup, node.InputAttributeTypeEmail, node.WithRequiredInputAttribute).
+				WithMetaLabel(text.NewInfoNodeInputEmail()),
+		)
+	case flow.StateRecoveryAwaitingAddress:
+		// re-initialize the UI with a "clean" new state
+		f.UI = &container.Container{
+			Method: "POST",
+			Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+		}
+		f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
+		f.UI.GetNodes().Append(
+			node.NewInputField("recovery_address", nil, node.CodeGroup, node.InputAttributeTypeText, node.WithRequiredInputAttribute).
+				WithMetaLabel(text.NewRecoveryAskAnyRecoveryAddress()),
+		)
+	default:
+		// Unreachable.
+		return errors.Errorf("unreachable state: %s", f.State)
+	}
+
 	f.UI.
 		GetNodes().
 		Append(node.NewInputField("method", s.RecoveryStrategyID(), node.CodeGroup, node.InputAttributeTypeSubmit).
@@ -89,6 +120,30 @@ type updateRecoveryFlowWithCodeMethod struct {
 	//
 	// required: false
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
+
+	// A recovery address that is registered for the user.
+	// It can be an email, a phone number (to receive the code via SMS), etc.
+	// Used in RecoveryV2.
+	RecoveryAddress string `json:"recovery_address" form:"recovery_address"`
+
+	// If there are multiple addresses registered for the user, a choice is presented and this field
+	// stores the result of this choice.
+	// Addresses are 'masked' (never sent in full to the client and shown partially in the UI) since at this point in the recovery flow,
+	// the user has not yet proven that it knows the full address and we want to avoid
+	// information exfiltration.
+	// So for all intents and purposes, the value of this field should be treated as an opaque identifier.
+	// Used in RecoveryV2.
+	RecoverySelectAddress string `json:"recovery_select_address" form:"recovery_select_address"`
+
+	// If there are multiple recovery addresses registered for the user, and the initially provided address
+	// is different from the address chosen when the choice (of masked addresses) is presented, then we need to make sure
+	// that the user actually knows the full address to avoid information exfiltration, so we ask for the full address.
+	// Used in RecoveryV2.
+	RecoveryConfirmAddress string `json:"recovery_confirm_address" form:"recovery_confirm_address"`
+
+	// Set to "previous" to go back in the flow, meaningfully.
+	// Used in RecoveryV2.
+	Screen string `json:"screen" form:"screen"`
 }
 
 func (s *Strategy) isCodeFlow(f *recovery.Flow) bool {
@@ -130,26 +185,35 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 
 	f.UI.ResetMessages()
 
-	// If the email is present in the submission body, the user needs a new code via resend
-	if f.State != flow.StateChooseMethod && len(body.Email) == 0 {
-		if err := flow.MethodEnabledAndAllowed(ctx, flow.RecoveryFlow, sID, sID, s.deps); err != nil {
-			return s.HandleRecoveryError(w, r, nil, body, err)
+	// NOTE: This is implicitly looking at the state machine (for Recovery v1), by inspecting which fields are present,
+	// instead of inspecting the state explicitly.
+	// For Recovery v2 we inspect the state explicitly, a few lines below.
+	if !flow.IsStateRecoveryV2(f.State) {
+		// If the email is not present in the submission body, the user needs a new code via resend
+		if f.State != flow.StateChooseMethod && len(body.Email) == 0 {
+			if err := flow.MethodEnabledAndAllowed(ctx, flow.RecoveryFlow, sID, sID, s.deps); err != nil {
+				return s.HandleRecoveryError(w, r, nil, body, err)
+			}
+			return s.recoveryUseCode(w, r, body, f)
 		}
-		return s.recoveryUseCode(w, r, body, f)
 	}
 
 	if _, err := s.deps.SessionManager().FetchFromRequest(ctx, r); err == nil {
 		// User is already logged in
 		if x.IsJSONRequest(r) {
-			session.RespondWithJSONErrorOnAuthenticated(s.deps.Writer(), recovery.ErrAlreadyLoggedIn)(w, r, nil)
+			session.RespondWithJSONErrorOnAuthenticated(s.deps.Writer(), recovery.ErrAlreadyLoggedIn)(w, r)
 		} else {
-			session.RedirectOnAuthenticated(s.deps)(w, r, nil)
+			session.RedirectOnAuthenticated(s.deps)(w, r)
 		}
 		return errors.WithStack(flow.ErrCompletedByStrategy)
 	}
 
-	if err := flow.MethodEnabledAndAllowed(ctx, flow.RecoveryFlow, sID, body.Method, s.deps); err != nil {
-		return s.HandleRecoveryError(w, r, nil, body, err)
+	// Recovery V1 sets some magic fields in the UI and inspects them in the body, e.g. `method`.
+	// This is brittle and rendered unnecessary in Recovery V2 by properly inspecting the `state` (and the CSRF token).
+	if !flow.IsStateRecoveryV2(f.State) {
+		if err := flow.MethodEnabledAndAllowed(ctx, flow.RecoveryFlow, sID, body.Method, s.deps); err != nil {
+			return s.HandleRecoveryError(w, r, nil, body, err)
+		}
 	}
 
 	recoveryFlow, err := s.deps.RecoveryFlowPersister().GetRecoveryFlow(ctx, x.ParseUUID(body.Flow))
@@ -161,6 +225,10 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 		return s.HandleRecoveryError(w, r, recoveryFlow, body, err)
 	}
 
+	if body.Screen == "previous" {
+		return s.recoveryV2HandleGoBack(r, f, body)
+	}
+
 	switch recoveryFlow.State {
 	case flow.StateChooseMethod,
 		flow.StateEmailSent:
@@ -168,6 +236,17 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 	case flow.StatePassedChallenge:
 		// was already handled, do not allow retry
 		return s.retryRecoveryFlow(w, r, recoveryFlow.Type, RetryWithMessage(text.NewErrorValidationRecoveryRetrySuccess()))
+
+		// Recovery V2.
+	case flow.StateRecoveryAwaitingAddress:
+		return s.recoveryV2HandleStateAwaitingAddress(r, recoveryFlow, body)
+	case flow.StateRecoveryAwaitingAddressChoice:
+		return s.recoveryV2HandleStateAwaitingAddressChoice(r, recoveryFlow, body)
+	case flow.StateRecoveryAwaitingAddressConfirm:
+		return s.recoveryV2HandleStateConfirmingAddress(r, recoveryFlow, body)
+	case flow.StateRecoveryAwaitingCode:
+		return s.recoveryV2HandleStateAwaitingCode(w, r, recoveryFlow, body)
+
 	default:
 		return s.retryRecoveryFlow(w, r, recoveryFlow.Type, RetryWithMessage(text.NewErrorValidationRecoveryStateFailure()))
 	}
@@ -213,7 +292,7 @@ func (s *Strategy) recoveryIssueSession(w http.ResponseWriter, r *http.Request, 
 		f.ContinueWith = append(f.ContinueWith, flow.NewContinueWithSetToken(sess.Token))
 	}
 
-	sf, err := s.deps.SettingsHandler().NewFlow(w, r, sess.Identity, f.Type)
+	sf, err := s.deps.SettingsHandler().NewFlow(ctx, w, r, sess.Identity, f.Type)
 	if err != nil {
 		return s.retryRecoveryFlow(w, r, f.Type, RetryWithError(err))
 	}
@@ -223,7 +302,7 @@ func (s *Strategy) recoveryIssueSession(w http.ResponseWriter, r *http.Request, 
 	if returnToURL != nil {
 		returnTo = returnToURL.String()
 	}
-	sf.RequestURL, err = x.TakeOverReturnToParameter(f.RequestURL, sf.RequestURL, returnTo)
+	sf.RequestURL, err = redir.TakeOverReturnToParameter(f.RequestURL, sf.RequestURL, returnTo)
 	if err != nil {
 		return s.retryRecoveryFlow(w, r, f.Type, RetryWithError(err))
 	}
@@ -245,6 +324,7 @@ func (s *Strategy) recoveryIssueSession(w http.ResponseWriter, r *http.Request, 
 			http.Redirect(w, r, redirectTo, http.StatusSeeOther)
 		}
 	} else {
+		trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "no_continue_with_transition_recovery_issue_session"))
 		if x.IsJSONRequest(r) {
 			s.deps.Writer().WriteError(w, r, flow.NewBrowserLocationChangeRequiredError(sf.AppendTo(s.deps.Config().SelfServiceFlowSettingsUI(r.Context())).String()))
 		} else {
@@ -255,6 +335,10 @@ func (s *Strategy) recoveryIssueSession(w http.ResponseWriter, r *http.Request, 
 	return errors.WithStack(flow.ErrCompletedByStrategy)
 }
 
+// NOTE: This function handles two cases:
+//   - A code was submitted: try to use it
+//   - No code was submitted: delete all existing codes, re-generate a new one, send it.
+//     This corresponds to the user clicking on the 're-send code' button.
 func (s *Strategy) recoveryUseCode(w http.ResponseWriter, r *http.Request, body *recoverySubmitPayload, f *recovery.Flow) error {
 	ctx := r.Context()
 	code, err := s.deps.RecoveryCodePersister().UseRecoveryCode(ctx, f.ID, body.Code)
@@ -275,7 +359,8 @@ func (s *Strategy) recoveryUseCode(w http.ResponseWriter, r *http.Request, body 
 		return s.retryRecoveryFlow(w, r, f.Type, RetryWithError(err))
 	}
 
-	recovered, err := s.deps.IdentityPool().GetIdentity(ctx, code.IdentityID, identity.ExpandDefault)
+	// Important to expand everything here, as we need the data for recovery.
+	recovered, err := s.deps.IdentityPool().GetIdentity(ctx, code.IdentityID, identity.ExpandEverything)
 	if err != nil {
 		return s.HandleRecoveryError(w, r, f, nil, err)
 	}
@@ -357,6 +442,7 @@ func (s *Strategy) retryRecoveryFlow(w http.ResponseWriter, r *http.Request, ft 
 			http.Redirect(w, r, f.AppendTo(config.SelfServiceFlowRecoveryUI(ctx)).String(), http.StatusSeeOther)
 		}
 	} else {
+		trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "no_continue_with_transition_recovery_retry_flow_handler"))
 		if x.IsJSONRequest(r) {
 			http.Redirect(w, r, urlx.CopyWithQuery(urlx.AppendPaths(config.SelfPublicURL(ctx),
 				recovery.RouteGetFlow), url.Values{"id": {f.ID.String()}}).String(), http.StatusSeeOther)
@@ -368,7 +454,309 @@ func (s *Strategy) retryRecoveryFlow(w http.ResponseWriter, r *http.Request, ft 
 	return errors.WithStack(flow.ErrCompletedByStrategy)
 }
 
-// recoveryHandleFormSubmission handles the submission of an Email for recovery
+func AddressToHashBase64(address string) string {
+	hash := sha256.Sum256([]byte(address))
+	return base64.StdEncoding.EncodeToString(hash[:])
+}
+
+func (s *Strategy) recoveryV2HandleStateAwaitingAddress(r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
+	if f.State != flow.StateRecoveryAwaitingAddress {
+		return errors.Errorf("unreachable state: %s", f.State)
+	}
+
+	if len(body.RecoveryAddress) == 0 {
+		return schema.NewRequiredError("#/recovery_address", "recovery_address")
+	}
+
+	// Need to retrieve all possible recovery addresses and present a choice.
+	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	// Real error.
+	if err != nil && !errors.Is(err, sqlcon.ErrNoRows) {
+		return err
+	}
+
+	// No rows returned.
+	if len(recoveryAddresses) == 0 {
+		// To avoid an attacker from using this case to probe for existing addresses, we pretend it exists.
+		// This is the same behavior as in Recovery V1.
+		recoveryAddresses = append(recoveryAddresses, identity.RecoveryAddress{Value: body.RecoveryAddress})
+	}
+
+	f.State = flow.StateRecoveryAwaitingAddressChoice
+
+	if len(recoveryAddresses) == 1 && recoveryAddresses[0].Value == body.RecoveryAddress {
+		// Skip two states for convenience:
+		// - No need to present a choice with only one option
+		// - No need to ask for the full address if there is only one and it was just provided in full
+
+		body.RecoveryConfirmAddress = body.RecoveryAddress
+		f.State = flow.StateRecoveryAwaitingAddressConfirm
+		if err := s.deps.RecoveryFlowPersister().UpdateRecoveryFlow(r.Context(), f); err != nil {
+			return err
+		}
+		return s.recoveryV2HandleStateConfirmingAddress(r, f, body)
+	}
+
+	// re-initialize the UI with a "clean" new state
+	f.UI = &container.Container{
+		Method: "POST",
+		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+	}
+
+	f.UI.SetCSRF(f.CSRFToken)
+
+	f.State = flow.StateRecoveryAwaitingAddressChoice
+	f.UI.Messages.Set(text.NewRecoveryAskToChooseAddress())
+
+	slices.SortFunc(recoveryAddresses, func(a, b identity.RecoveryAddress) int {
+		return strings.Compare(a.Value, b.Value)
+	})
+
+	for _, a := range recoveryAddresses {
+		// NOTE: Only send the masked value and the hash, to avoid information exfiltration.
+		// Why the hash? So that we can recognize later, when the user chooses the masked address in the list,
+		// that the chosen masked address is the `recovery_address` provided in the beginning,
+		// and then we do not ask again the user to provide it in full.
+		hashBase64 := AddressToHashBase64(a.Value)
+		f.UI.GetNodes().Append(node.NewInputField("recovery_select_address", hashBase64, node.CodeGroup, node.InputAttributeTypeSubmit).
+			WithMetaLabel(&text.Message{
+				ID:   text.InfoNodeLabel,
+				Text: MaskAddress(a.Value),
+				Type: text.Info,
+			}))
+	}
+
+	f.UI.Nodes.Append(node.NewInputField("method", s.NodeGroup(), node.CodeGroup, node.InputAttributeTypeHidden))
+	f.UI.Nodes.Append(node.NewInputField("recovery_address", body.RecoveryAddress, node.CodeGroup, node.InputAttributeTypeHidden))
+	// No back button here because there is no point for the user.
+
+	if err := s.deps.RecoveryFlowPersister().UpdateRecoveryFlow(r.Context(), f); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Strategy) recoveryV2HandleStateAwaitingAddressChoice(r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
+	if f.State != flow.StateRecoveryAwaitingAddressChoice {
+		return errors.Errorf("unreachable state: %s", f.State)
+	}
+
+	if len(body.RecoverySelectAddress) == 0 {
+		return schema.NewRequiredError("#/recovery_select_address", "recovery_select_address")
+	}
+
+	if len(body.RecoveryAddress) == 0 {
+		return schema.NewRequiredError("#/recovery_address", "recovery_address")
+	}
+
+	// Is the chosen masked address the same as the address provided in full at the beginning?
+	// If yes, then do not ask it again in full.
+	// Technically we check `hash(recovery_address) == recovery_select_address` and
+	// `recovery_select_address` is `hash(recovery_address)`.
+	hashBase64 := AddressToHashBase64(body.RecoveryAddress)
+
+	// Better safe than sorry, use constant time comparison.
+	if subtle.ConstantTimeCompare([]byte(hashBase64), []byte(body.RecoverySelectAddress)) == 1 {
+		// Skip a state: do not ask the user again to provide the full address.
+		body.RecoveryConfirmAddress = body.RecoveryAddress
+		f.State = flow.StateRecoveryAwaitingAddressConfirm
+		return s.recoveryV2HandleStateConfirmingAddress(r, f, body)
+	}
+
+	// re-initialize the UI with a "clean" new state
+	f.UI = &container.Container{
+		Method: "POST",
+		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+	}
+	f.UI.SetCSRF(f.CSRFToken)
+
+	f.State = flow.StateRecoveryAwaitingAddressConfirm
+	f.UI.Messages.Set(text.NewRecoveryAskForFullAddress())
+
+	// Retrieve the selected recovery address in plaintext to determine the input label and type.
+	var plaintextRecoveryAddress string
+	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	if err == nil {
+		for _, a := range recoveryAddresses {
+			if subtle.ConstantTimeCompare([]byte(AddressToHashBase64(a.Value)), []byte(body.RecoverySelectAddress)) == 1 {
+				plaintextRecoveryAddress = a.Value
+				break
+			}
+		}
+	}
+	if plaintextRecoveryAddress == "" {
+		return herodot.ErrBadRequest.
+			WithReason("The selected recovery address is not valid.").
+			WithDebug("The selected recovery address does not match any of the known recovery addresses.")
+	}
+
+	var inputType node.UiNodeInputAttributeType
+	var label *text.Message
+	if strings.ContainsRune(plaintextRecoveryAddress, '@') {
+		inputType = node.InputAttributeTypeEmail
+		label = text.NewInfoNodeInputEmail()
+	} else {
+		inputType = node.InputAttributeTypeTel
+		label = text.NewInfoNodeInputPhoneNumber()
+	}
+
+	f.UI.Nodes.Append(node.NewInputField("recovery_confirm_address", body.RecoveryConfirmAddress, node.CodeGroup, inputType, node.WithRequiredInputAttribute).
+		WithMetaLabel(label),
+	)
+	f.UI.Nodes.Append(node.NewInputField("recovery_address", body.RecoveryAddress, node.CodeGroup, node.InputAttributeTypeHidden))
+
+	f.UI.
+		GetNodes().
+		Append(node.NewInputField("method", s.RecoveryStrategyID(), node.CodeGroup, node.InputAttributeTypeSubmit).
+			WithMetaLabel(text.NewInfoNodeLabelContinue()))
+
+	f.UI.Nodes.Append(node.NewInputField("method", s.NodeGroup(), node.CodeGroup, node.InputAttributeTypeHidden))
+
+	buttonScreen := node.NewInputField("screen", "previous", node.CodeGroup, node.InputAttributeTypeSubmit).
+		WithMetaLabel(text.NewRecoveryBack())
+	f.UI.GetNodes().Append(buttonScreen)
+
+	if err := s.deps.RecoveryFlowPersister().UpdateRecoveryFlow(r.Context(), f); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Strategy) recoveryV2HandleStateConfirmingAddress(r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
+	if f.State != flow.StateRecoveryAwaitingAddressConfirm {
+		return errors.Errorf("unreachable state: %s", f.State)
+	}
+
+	if len(body.RecoveryConfirmAddress) == 0 {
+		return schema.NewRequiredError("#/recovery_confirm_address", "recovery_confirm_address")
+	}
+
+	if err := s.deps.RecoveryCodePersister().DeleteRecoveryCodesOfFlow(r.Context(), f.ID); err != nil {
+		return err
+	}
+
+	f.TransientPayload = body.TransientPayload
+
+	var addressType identity.RecoveryAddressType
+	// Inferring the address type like this is a bit hacky, and actually not really necessary.
+	// That's because `SendRecoveryCode` expects it, but not because it fundamentally is required.
+	if strings.ContainsRune(body.RecoveryConfirmAddress, '@') {
+		addressType = identity.RecoveryAddressTypeEmail
+	} else {
+		addressType = identity.RecoveryAddressTypeSMS
+	}
+
+	// NOTE: We do not fetch the db address here. We only (try to) send the code to the user provided address.
+	// That way we avoid information exfiltration.
+	// `SendRecoveryCode` will anyway check by itself if the provided address is a known address or not.
+	if err := s.deps.CodeSender().SendRecoveryCode(r.Context(), f, addressType, body.RecoveryConfirmAddress); err != nil {
+		if !errors.Is(err, ErrUnknownAddress) {
+			return err
+		}
+
+		// Continue execution
+	}
+
+	// re-initialize the UI with a "clean" new state
+	f.UI = &container.Container{
+		Method: "POST",
+		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+	}
+	f.UI.SetCSRF(f.CSRFToken)
+
+	f.State = flow.StateRecoveryAwaitingCode
+
+	uiText := text.NewRecoveryCodeRecoverySelectAddressSent(MaskAddress(body.RecoveryConfirmAddress))
+
+	f.UI.Messages.Set(uiText)
+	f.UI.Nodes.Append(node.NewInputField("code", nil, node.CodeGroup, node.InputAttributeTypeText, node.WithInputAttributes(func(a *node.InputAttributes) {
+		a.Required = true
+		a.Pattern = "[0-9]+"
+		a.MaxLength = CodeLength
+	})).
+		WithMetaLabel(text.NewInfoNodeLabelRecoveryCode()),
+	)
+
+	f.UI.Nodes.Append(node.NewInputField("method", s.NodeGroup(), node.CodeGroup, node.InputAttributeTypeSubmit).
+		WithMetaLabel(text.NewInfoNodeLabelContinue()),
+	)
+
+	f.UI.Nodes.Append(node.NewInputField("method", s.NodeGroup(), node.CodeGroup, node.InputAttributeTypeHidden))
+
+	// Required to make 'resend' work.
+	f.UI.Nodes.Append(node.NewInputField("recovery_confirm_address", body.RecoveryConfirmAddress, node.CodeGroup, node.InputAttributeTypeSubmit).
+		WithMetaLabel(text.NewInfoNodeResendOTP()),
+	)
+	f.UI.Nodes.Append(node.NewInputField("recovery_address", body.RecoveryAddress, node.CodeGroup, node.InputAttributeTypeHidden))
+
+	buttonScreen := node.NewInputField("screen", "previous", node.CodeGroup, node.InputAttributeTypeSubmit).
+		WithMetaLabel(text.NewRecoveryBack())
+	f.UI.GetNodes().Append(buttonScreen)
+
+	if err := s.deps.RecoveryFlowPersister().UpdateRecoveryFlow(r.Context(), f); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Strategy) recoveryV2HandleStateAwaitingCode(w http.ResponseWriter, r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
+	if f.State != flow.StateRecoveryAwaitingCode {
+		return errors.Errorf("unreachable state: %s", f.State)
+	}
+
+	if len(body.Code) == 0 {
+		// The 're-send' button was clicked. We handle it as if the user first arrived at the state `RecoveryV2StateAwaitingAddressConfirm`.
+		// That will invalidate all existing codes and send a new code.
+		f.State = flow.StateRecoveryAwaitingAddressConfirm
+		return s.recoveryV2HandleStateConfirmingAddress(r, f, body)
+	} else {
+		return s.recoveryUseCode(w, r, body, f)
+	}
+}
+
+func (s *Strategy) recoveryV2HandleGoBack(r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
+	// If no address choice needs to take place, just go to the first screen.
+	recoveryAddresses, _ := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	if len(recoveryAddresses) <= 1 {
+		f.State = flow.StateRecoveryAwaitingAddress
+		err := s.PopulateRecoveryMethod(r, f)
+		if err != nil {
+			return err
+		}
+
+		if err := s.deps.RecoveryFlowPersister().UpdateRecoveryFlow(r.Context(), f); err != nil {
+			return err
+		}
+
+	}
+
+	switch f.State {
+	// Go back to the second screen (choose an address) by essentially going to the first screen
+	// and re-submitting the form (to arrive at the second screen).
+	// This contraption is necessary since the UI nodes are stored in the database and not generated on the fly.
+	// So simply redirecting to a previous screen (as in: 'web page') would do nothing, it would just show the same UI.
+	// This way we force the UI generation code to re-run and the new UI nodes to be stored to the database.
+	case flow.StateRecoveryAwaitingCode:
+		fallthrough
+	case flow.StateRecoveryAwaitingAddressConfirm:
+		// Reset some body fields since we are going to (almost) the beginning of the flow.
+		body.RecoveryConfirmAddress = ""
+		body.RecoverySelectAddress = ""
+		body.Screen = ""
+
+		f.State = flow.StateRecoveryAwaitingAddress
+
+		return s.recoveryV2HandleStateAwaitingAddress(r, f, body)
+	default:
+		// Should not trigger, but do something sensible: start from scratch.
+		return s.PopulateRecoveryMethod(r, f)
+	}
+}
+
+// recoveryHandleFormSubmission handles the submission of an address for recovery
 func (s *Strategy) recoveryHandleFormSubmission(w http.ResponseWriter, r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
 	if len(body.Email) == 0 {
 		return s.HandleRecoveryError(w, r, f, body, schema.NewRequiredError("#/email", "email"))
@@ -386,7 +774,7 @@ func (s *Strategy) recoveryHandleFormSubmission(w http.ResponseWriter, r *http.R
 	}
 
 	f.TransientPayload = body.TransientPayload
-	if err := s.deps.CodeSender().SendRecoveryCode(ctx, f, identity.VerifiableAddressTypeEmail, body.Email); err != nil {
+	if err := s.deps.CodeSender().SendRecoveryCode(ctx, f, identity.RecoveryAddressTypeEmail, body.Email); err != nil {
 		if !errors.Is(err, ErrUnknownAddress) {
 			return s.HandleRecoveryError(w, r, f, body, err)
 		}
@@ -429,37 +817,33 @@ func (s *Strategy) recoveryHandleFormSubmission(w http.ResponseWriter, r *http.R
 }
 
 func (s *Strategy) markRecoveryAddressVerified(w http.ResponseWriter, r *http.Request, f *recovery.Flow, id *identity.Identity, recoveryAddress *identity.RecoveryAddress) error {
-	var address *identity.VerifiableAddress
-	for idx := range id.VerifiableAddresses {
-		va := id.VerifiableAddresses[idx]
-		if va.Value == recoveryAddress.Value {
-			address = &va
-			break
-		}
-	}
-
-	if address != nil && !address.Verified { // can it be that the address is nil?
-		address.Verified = true
-		verifiedAt := sqlxx.NullTime(time.Now().UTC())
-		address.VerifiedAt = &verifiedAt
-		address.Status = identity.VerifiableAddressStatusCompleted
-		if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(r.Context(), address); err != nil {
-			return s.HandleRecoveryError(w, r, f, nil, err)
+	for k, v := range id.VerifiableAddresses {
+		if v.Value == recoveryAddress.Value {
+			id.VerifiableAddresses[k].Verified = true
+			id.VerifiableAddresses[k].VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
+			id.VerifiableAddresses[k].Status = identity.VerifiableAddressStatusCompleted
+			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(r.Context(), &id.VerifiableAddresses[k], "verified", "verified_at", "status"); err != nil {
+				return s.HandleRecoveryError(w, r, f, nil, err)
+			}
 		}
 	}
 
 	return nil
 }
 
-func (s *Strategy) HandleRecoveryError(w http.ResponseWriter, r *http.Request, flow *recovery.Flow, body *recoverySubmitPayload, err error) error {
-	if flow != nil {
+func (s *Strategy) HandleRecoveryError(w http.ResponseWriter, r *http.Request, fl *recovery.Flow, body *recoverySubmitPayload, err error) error {
+	if fl != nil {
+		if flow.IsStateRecoveryV2(fl.State) {
+			// Unreachable: RecoveryV2 never uses this function.
+			return err
+		}
 		email := ""
 		if body != nil {
 			email = body.Email
 		}
 
-		flow.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
-		flow.UI.GetNodes().Upsert(
+		fl.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
+		fl.UI.GetNodes().Upsert(
 			node.NewInputField("email", email, node.CodeGroup, node.InputAttributeTypeEmail, node.WithRequiredInputAttribute).
 				WithMetaLabel(text.NewInfoNodeInputEmail()),
 		)
@@ -475,6 +859,12 @@ type recoverySubmitPayload struct {
 	Flow             string          `json:"flow" form:"flow"`
 	Email            string          `json:"email" form:"email"`
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
+
+	// Used in RecoveryV2.
+	RecoveryAddress        string `json:"recovery_address" form:"recovery_address"`
+	RecoverySelectAddress  string `json:"recovery_select_address" form:"recovery_select_address"`
+	RecoveryConfirmAddress string `json:"recovery_confirm_address" form:"recovery_confirm_address"`
+	Screen                 string `json:"screen" form:"screen"`
 }
 
 func (s *Strategy) decodeRecovery(r *http.Request) (*recoverySubmitPayload, error) {

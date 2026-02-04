@@ -8,13 +8,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/persistence"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlcon"
@@ -23,7 +23,6 @@ import (
 func TestPersister(ctx context.Context, tracer *otelx.Tracer, p persistence.Persister) func(t *testing.T) {
 	return func(t *testing.T) {
 		t.Run("method=batch.Create", func(t *testing.T) {
-
 			ident1 := identity.NewIdentity("")
 			ident1.NID = p.NetworkID(ctx)
 			ident2 := identity.NewIdentity("")

@@ -8,41 +8,28 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-	"github.com/ory/kratos/internal"
-
 	"github.com/stretchr/testify/assert"
-
-	"github.com/ory/kratos/internal/testhelpers"
-	"github.com/ory/x/stringslice"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/selfservice/strategy/code"
+	"github.com/ory/x/contextx"
 )
 
 func initViper(t *testing.T, ctx context.Context, c *config.Config) {
 	testhelpers.SetDefaultIdentitySchema(c, "file://./stub/default.schema.json")
-	c.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh")
-	c.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh"})
+	c.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.com")
+	c.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.com"})
 	c.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+identity.CredentialsTypePassword.String()+".enabled", true)
 	c.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(recovery.RecoveryStrategyCode)+".enabled", true)
 	c.MustSet(ctx, config.ViperKeySelfServiceRecoveryEnabled, true)
 	c.MustSet(ctx, config.ViperKeySelfServiceRecoveryUse, "code")
 	c.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
 	c.MustSet(ctx, config.ViperKeySelfServiceVerificationUse, "code")
-}
-
-func TestGenerateCode(t *testing.T) {
-	codes := make([]string, 100)
-	for k := range codes {
-		codes[k] = code.GenerateCode()
-	}
-
-	assert.Len(t, stringslice.Unique(codes), len(codes))
 }
 
 func TestMaskAddress(t *testing.T) {
@@ -128,8 +115,8 @@ func TestCountActiveCredentials(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValue(ctx, "selfservice.methods.code.passwordless_enabled", tc.passwordlessEnabled)
-				ctx = confighelpers.WithConfigValue(ctx, "selfservice.methods.code.enabled", tc.enabled)
+				ctx := contextx.WithConfigValue(ctx, "selfservice.methods.code.passwordless_enabled", tc.passwordlessEnabled)
+				ctx = contextx.WithConfigValue(ctx, "selfservice.methods.code.enabled", tc.enabled)
 
 				cc := map[identity.CredentialsType]identity.Credentials{}
 				for _, c := range tc.in {
@@ -166,13 +153,13 @@ func TestCountActiveCredentials(t *testing.T) {
 				}},
 				mfaEnabled: true,
 				enabled:    false,
-				expected:   1,
+				expected:   0,
 			},
 			{
 				in:         map[identity.CredentialsType]identity.Credentials{},
 				mfaEnabled: true,
 				enabled:    true,
-				expected:   1,
+				expected:   0,
 			},
 			{
 				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
@@ -181,12 +168,57 @@ func TestCountActiveCredentials(t *testing.T) {
 				}},
 				mfaEnabled: true,
 				enabled:    true,
+				expected:   0,
+			},
+			{
+				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+					Type:   strategy.ID(),
+					Config: []byte(`{"address_type":"email","used_at":{"Time":"0001-01-01T00:00:00Z","Valid":false}}`),
+				}},
+				mfaEnabled: true,
+				enabled:    true,
 				expected:   1,
+			},
+			{
+				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+					Type:   strategy.ID(),
+					Config: []byte(`{"addresses":[{"channel":"email","address":"test@ory.sh"}]}`),
+				}},
+				mfaEnabled: true,
+				enabled:    true,
+				expected:   1,
+			},
+			{
+				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+					Type:   strategy.ID(),
+					Config: []byte(`{"addresses":[]}`),
+				}},
+				mfaEnabled: true,
+				enabled:    true,
+				expected:   0,
+			},
+			{
+				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+					Type:   strategy.ID(),
+					Config: []byte(`{"addresses":[{"channel":"sms","address":"+1234567890"}]}`),
+				}},
+				mfaEnabled: true,
+				enabled:    true,
+				expected:   1,
+			},
+			{
+				in: map[identity.CredentialsType]identity.Credentials{strategy.ID(): {
+					Type:   strategy.ID(),
+					Config: []byte(`{"addresses":[{"channel":"sms","address":"+1234567890"},{"channel":"email","address":"test@ory.sh"}]}`),
+				}},
+				mfaEnabled: true,
+				enabled:    true,
+				expected:   2,
 			},
 		} {
 			t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValue(ctx, "selfservice.methods.code.mfa_enabled", tc.mfaEnabled)
-				ctx = confighelpers.WithConfigValue(ctx, "selfservice.methods.code.enabled", tc.enabled)
+				ctx := contextx.WithConfigValue(ctx, "selfservice.methods.code.mfa_enabled", tc.mfaEnabled)
+				ctx = contextx.WithConfigValue(ctx, "selfservice.methods.code.enabled", tc.enabled)
 
 				cc := map[identity.CredentialsType]identity.Credentials{}
 				for _, c := range tc.in {

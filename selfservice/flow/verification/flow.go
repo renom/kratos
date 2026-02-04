@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gobuffalo/pop/v6"
+	"github.com/ory/kratos/x/redir"
+
+	"github.com/ory/pop/v6"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -23,8 +25,6 @@ import (
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
-
-var _ flow.Flow = new(Flow)
 
 // A Verification Flow
 //
@@ -111,19 +111,7 @@ type OAuth2LoginChallengeParams struct {
 	AMR session.AuthenticationMethods `db:"authentication_methods" json:"-"`
 }
 
-var _ flow.Flow = new(Flow)
-
-func (f *Flow) GetType() flow.Type {
-	return f.Type
-}
-
-func (f *Flow) GetRequestURL() string {
-	return f.RequestURL
-}
-
-func (f Flow) TableName(context.Context) string {
-	return "selfservice_verification_flows"
-}
+var _ flow.Flow = (*Flow)(nil)
 
 func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, ft flow.Type) (*Flow, error) {
 	now := time.Now().UTC()
@@ -131,11 +119,11 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
 	requestURL := x.RequestURL(r).String()
-	_, err := x.SecureRedirectTo(r,
+	_, err := redir.SecureRedirectTo(r,
 		conf.SelfServiceBrowserDefaultReturnTo(r.Context()),
-		x.SecureRedirectUseSourceURL(requestURL),
-		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
-		x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
+		redir.SecureRedirectUseSourceURL(requestURL),
+		redir.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
+		redir.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
 	)
 	if err != nil {
 		return nil, err
@@ -199,8 +187,22 @@ func NewPostHookFlow(conf *config.Config, exp time.Duration, csrf string, r *htt
 	query.Del("after_verification_return_to")
 	requestURL.RawQuery = query.Encode()
 	f.RequestURL = requestURL.String()
+	if t, ok := original.(flow.OAuth2ChallengeProvider); ok {
+		f.OAuth2LoginChallenge = t.GetOAuth2LoginChallenge()
+	}
 	return f, nil
 }
+
+func (f *Flow) GetType() flow.Type                        { return f.Type }
+func (f *Flow) GetRequestURL() string                     { return f.RequestURL }
+func (Flow) TableName() string                            { return "selfservice_verification_flows" }
+func (f Flow) GetID() uuid.UUID                           { return f.ID }
+func (f *Flow) GetState() State                           { return f.State }
+func (Flow) GetFlowName() flow.FlowName                   { return flow.VerificationFlow }
+func (f *Flow) SetState(state State)                      { f.State = state }
+func (f *Flow) GetTransientPayload() json.RawMessage      { return f.TransientPayload }
+func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString { return f.OAuth2LoginChallenge }
+func (f *Flow) GetUI() *container.Container               { return f.UI }
 
 func (f *Flow) Valid() error {
 	if f.ExpiresAt.Before(time.Now()) {
@@ -213,14 +215,6 @@ func (f *Flow) AppendTo(src *url.URL) *url.URL {
 	values := src.Query()
 	values.Set("flow", f.ID.String())
 	return urlx.CopyWithQuery(src, values)
-}
-
-func (f Flow) GetID() uuid.UUID {
-	return f.ID
-}
-
-func (f Flow) GetNID() uuid.UUID {
-	return f.NID
 }
 
 func (f *Flow) SetCSRFToken(token string) {
@@ -250,10 +244,6 @@ func (f *Flow) AfterSave(*pop.Connection) error {
 	return nil
 }
 
-func (f *Flow) GetUI() *container.Container {
-	return f.UI
-}
-
 // ContinueURL generates the URL to show on the continue screen after succesful verification
 //
 // It follows the following precedence:
@@ -272,31 +262,15 @@ func (f *Flow) ContinueURL(ctx context.Context, config *config.Config) *url.URL 
 
 	verificationRequest := http.Request{URL: verificationRequestURL}
 
-	returnTo, err := x.SecureRedirectTo(&verificationRequest, flowContinueURL,
-		x.SecureRedirectAllowSelfServiceURLs(config.SelfPublicURL(ctx)),
-		x.SecureRedirectAllowURLs(config.SelfServiceBrowserAllowedReturnToDomains(ctx)),
+	returnTo, err := redir.SecureRedirectTo(&verificationRequest, flowContinueURL,
+		redir.SecureRedirectAllowSelfServiceURLs(config.SelfPublicURL(ctx)),
+		redir.SecureRedirectAllowURLs(config.SelfServiceBrowserAllowedReturnToDomains(ctx)),
 	)
 	if err != nil {
 		// an error occured return flow default, or global default return URL
 		return flowContinueURL
 	}
 	return returnTo
-}
-
-func (f *Flow) GetState() State {
-	return f.State
-}
-
-func (f *Flow) GetFlowName() flow.FlowName {
-	return flow.VerificationFlow
-}
-
-func (f *Flow) SetState(state State) {
-	f.State = state
-}
-
-func (t *Flow) GetTransientPayload() json.RawMessage {
-	return t.TransientPayload
 }
 
 func (f *Flow) ToLoggerField() map[string]interface{} {

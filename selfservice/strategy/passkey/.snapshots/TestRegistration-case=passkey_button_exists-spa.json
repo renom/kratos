@@ -2,6 +2,19 @@
   {
     "attributes": {
       "disabled": false,
+      "name": "csrf_token",
+      "node_type": "input",
+      "required": true,
+      "type": "hidden"
+    },
+    "group": "default",
+    "messages": [],
+    "meta": {},
+    "type": "input"
+  },
+  {
+    "attributes": {
+      "disabled": false,
       "name": "traits.foobar",
       "node_type": "input",
       "required": true,
@@ -27,23 +40,10 @@
   },
   {
     "attributes": {
-      "disabled": false,
-      "name": "csrf_token",
-      "node_type": "input",
-      "required": true,
-      "type": "hidden"
-    },
-    "group": "default",
-    "messages": [],
-    "meta": {},
-    "type": "input"
-  },
-  {
-    "attributes": {
       "async": true,
       "crossorigin": "anonymous",
       "id": "webauthn_script",
-      "integrity": "sha512-MDzBlwh32rr+eus2Yf1BetIj94m+ULLbewYDulbZjczycs81klNed+qQWG2yi2N03KV5uZlRJJtWdV2x9JNHzQ==",
+      "integrity": "sha512-Dg0gN3fy+JoKxRp9Zda/4KYn3SlMdaKjs3fK5g6nDVQ/CVakD1dfMQyvRtJeiAtzSMEFviJbBLcVSrsBPGsFBA==",
       "node_type": "script",
       "referrerpolicy": "no-referrer",
       "type": "text/javascript"
@@ -52,18 +52,6 @@
     "messages": [],
     "meta": {},
     "type": "script"
-  },
-  {
-    "attributes": {
-      "disabled": false,
-      "name": "passkey_register",
-      "node_type": "input",
-      "type": "hidden"
-    },
-    "group": "passkey",
-    "messages": [],
-    "meta": {},
-    "type": "input"
   },
   {
     "attributes": {
@@ -83,6 +71,18 @@
         "type": "info"
       }
     },
+    "type": "input"
+  },
+  {
+    "attributes": {
+      "disabled": false,
+      "name": "passkey_register",
+      "node_type": "input",
+      "type": "hidden"
+    },
+    "group": "passkey",
+    "messages": [],
+    "meta": {},
     "type": "input"
   },
   {

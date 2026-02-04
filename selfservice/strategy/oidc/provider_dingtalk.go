@@ -28,6 +28,8 @@ type ProviderDingTalk struct {
 	reg    Dependencies
 }
 
+var _ OAuth2Provider = (*ProviderDingTalk)(nil)
+
 func NewProviderDingTalk(
 	config *Configuration,
 	reg Dependencies,
@@ -43,7 +45,7 @@ func (g *ProviderDingTalk) Config() *Configuration {
 }
 
 func (g *ProviderDingTalk) oauth2(ctx context.Context) *oauth2.Config {
-	var endpoint = oauth2.Endpoint{
+	endpoint := oauth2.Endpoint{
 		AuthURL:  "https://login.dingtalk.com/oauth2/auth",
 		TokenURL: "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
 	}
@@ -75,7 +77,7 @@ func (g *ProviderDingTalk) OAuth2(ctx context.Context) (*oauth2.Config, error) {
 func (g *ProviderDingTalk) ExchangeOAuth2Token(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
 	conf, err := g.OAuth2(ctx)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, err
 	}
 
 	pTokenParams := &struct {
@@ -86,22 +88,22 @@ func (g *ProviderDingTalk) ExchangeOAuth2Token(ctx context.Context, code string,
 	}{conf.ClientID, conf.ClientSecret, code, "authorization_code"}
 	bs, err := json.Marshal(pTokenParams)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	r := strings.NewReader(string(bs))
 	client := g.reg.HTTPClient(ctx, httpx.ResilientClientDisallowInternalIPs())
 	req, err := retryablehttp.NewRequest("POST", conf.Endpoint.TokenURL, r)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	req.Header.Add("Content-Type", "application/json;charset=UTF-8")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
 		return nil, err
@@ -115,11 +117,11 @@ func (g *ProviderDingTalk) ExchangeOAuth2Token(ctx context.Context, code string,
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&dToken); err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	if dToken.ErrCode != 0 {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("dToken.ErrCode = %d, dToken.ErrMsg = %s", dToken.ErrCode, dToken.ErrMsg))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithReasonf("dToken.ErrCode = %d, dToken.ErrMsg = %s", dToken.ErrCode, dToken.ErrMsg))
 	}
 
 	token := &oauth2.Token{
@@ -136,15 +138,15 @@ func (g *ProviderDingTalk) Claims(ctx context.Context, exchange *oauth2.Token, _
 	client := g.reg.HTTPClient(ctx, httpx.ResilientClientDisallowInternalIPs())
 	req, err := retryablehttp.NewRequest("GET", userInfoURL, nil)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	req.Header.Add("x-acs-dingtalk-access-token", accessToken)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
 		return nil, err
@@ -160,11 +162,11 @@ func (g *ProviderDingTalk) Claims(ctx context.Context, exchange *oauth2.Token, _
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	if user.ErrMsg != "" {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("userResp.ErrCode = %s, userResp.ErrMsg = %s", user.ErrCode, user.ErrMsg))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithReasonf("userResp.ErrCode = %s, userResp.ErrMsg = %s", user.ErrCode, user.ErrMsg))
 	}
 
 	return &Claims{

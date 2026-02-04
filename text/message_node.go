@@ -51,13 +51,14 @@ func NewInfoNodeInputPassword() *Message {
 	}
 }
 
-func NewInfoNodeLabelGenerated(title string) *Message {
+func NewInfoNodeLabelGenerated(title string, name string) *Message {
 	return &Message{
 		ID:   InfoNodeLabelGenerated,
 		Text: title,
 		Type: Info,
 		Context: context(map[string]any{
 			"title": title,
+			"name":  name,
 		}),
 	}
 }
@@ -98,6 +99,14 @@ func NewInfoNodeInputEmail() *Message {
 	return &Message{
 		ID:   InfoNodeLabelEmail,
 		Text: "Email",
+		Type: Info,
+	}
+}
+
+func NewInfoNodeInputPhoneNumber() *Message {
+	return &Message{
+		ID:   InfoNodeLabelPhoneNumber,
+		Text: "Phone number",
 		Type: Info,
 	}
 }

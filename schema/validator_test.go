@@ -14,16 +14,15 @@ import (
 	"github.com/ory/jsonschema/v3/httploader"
 	"github.com/ory/x/httpx"
 
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/x/stringsx"
 )
 
 func TestSchemaValidator(t *testing.T) {
-	router := httprouter.New()
+	router := http.NewServeMux()
 	fs := http.StripPrefix("/schema", http.FileServer(http.Dir("stub/validator")))
-	router.GET("/schema/:name", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	router.HandleFunc("/schema/{name}", func(w http.ResponseWriter, r *http.Request) {
 		fs.ServeHTTP(w, r)
 	})
 	ts := httptest.NewServer(router)
@@ -58,12 +57,12 @@ func TestSchemaValidator(t *testing.T) {
 		{
 			u:   ts.URL,
 			i:   json.RawMessage(`{ "firstName": "first-name", "lastName": "last-name", "age": 1 }`),
-			err: "An internal server error occurred, please contact the system administrator",
+			err: "Invalid configuration",
 		},
 		{
 			u:   "not-a-url",
 			i:   json.RawMessage(`{ "firstName": "first-name", "lastName": "last-name", "age": 1 }`),
-			err: "An internal server error occurred, please contact the system administrator",
+			err: "Invalid configuration",
 		},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {

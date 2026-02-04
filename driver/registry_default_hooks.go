@@ -4,7 +4,13 @@
 package driver
 
 import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/pkg/errors"
+
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/request"
 	"github.com/ory/kratos/selfservice/hook"
 )
 
@@ -13,13 +19,6 @@ func (m *RegistryDefault) HookVerifier() *hook.Verifier {
 		m.hookVerifier = hook.NewVerifier(m)
 	}
 	return m.hookVerifier
-}
-
-func (m *RegistryDefault) HookCodeAddressVerifier() *hook.CodeAddressVerifier {
-	if m.hookCodeAddressVerifier == nil {
-		m.hookCodeAddressVerifier = hook.NewCodeAddressVerifier(m)
-	}
-	return m.hookCodeAddressVerifier
 }
 
 func (m *RegistryDefault) HookSessionIssuer() *hook.SessionIssuer {
@@ -38,7 +37,7 @@ func (m *RegistryDefault) HookSessionDestroyer() *hook.SessionDestroyer {
 
 func (m *RegistryDefault) HookAddressVerifier() *hook.AddressVerifier {
 	if m.hookAddressVerifier == nil {
-		m.hookAddressVerifier = hook.NewAddressVerifier()
+		m.hookAddressVerifier = hook.NewAddressVerifier(m)
 	}
 	return m.hookAddressVerifier
 }
@@ -50,57 +49,68 @@ func (m *RegistryDefault) HookShowVerificationUI() *hook.ShowVerificationUIHook 
 	return m.hookShowVerificationUI
 }
 
-func (m *RegistryDefault) HookTwoStepRegistration() *hook.TwoStepRegistration {
-	if m.hookTwoStepRegistration == nil {
-		m.hookTwoStepRegistration = hook.NewTwoStepRegistration(m)
-	}
-	return m.hookTwoStepRegistration
-}
-
 func (m *RegistryDefault) WithHooks(hooks map[string]func(config.SelfServiceHook) interface{}) {
 	m.injectedSelfserviceHooks = hooks
 }
+func (m *RegistryDefault) WithExtraHandlers(handlers []NewHandlerRegistrar) {
+	m.extraHandlerFactories = handlers
+}
 
-func (m *RegistryDefault) getHooks(credentialsType string, configs []config.SelfServiceHook) (i []interface{}) {
+func getHooks[T any](m *RegistryDefault, credentialsType string, configs []config.SelfServiceHook) ([]T, error) {
+	hooks := make([]T, 0, len(configs))
+
 	var addSessionIssuer bool
+allHooksLoop:
 	for _, h := range configs {
 		switch h.Name {
 		case hook.KeySessionIssuer:
 			// The session issuer hook always needs to come last.
 			addSessionIssuer = true
 		case hook.KeySessionDestroyer:
-			i = append(i, m.HookSessionDestroyer())
+			if h, ok := any(m.HookSessionDestroyer()).(T); ok {
+				hooks = append(hooks, h)
+			}
 		case hook.KeyWebHook:
-			i = append(i, hook.NewWebHook(m, h.Config))
-		case hook.KeyAddressVerifier:
-			i = append(i, m.HookAddressVerifier())
+			cfg := request.Config{}
+			if err := json.Unmarshal(h.Config, &cfg); err != nil {
+				m.l.WithError(err).WithField("raw_config", string(h.Config)).Error("failed to unmarshal hook configuration, ignoring hook")
+				return nil, errors.WithStack(fmt.Errorf("failed to unmarshal webhook configuration for %s: %w", credentialsType, err))
+			}
+			if h, ok := any(hook.NewWebHook(m, &cfg)).(T); ok {
+				hooks = append(hooks, h)
+			}
+		case hook.KeyRequireVerifiedAddress:
+			if h, ok := any(m.HookAddressVerifier()).(T); ok {
+				hooks = append(hooks, h)
+			}
 		case hook.KeyVerificationUI:
-			i = append(i, m.HookShowVerificationUI())
-		case hook.KeyTwoStepRegistration:
-			i = append(i, m.HookTwoStepRegistration())
+			if h, ok := any(m.HookShowVerificationUI()).(T); ok {
+				hooks = append(hooks, h)
+			}
 		case hook.KeyVerifier:
-			i = append(i, m.HookVerifier())
+			if h, ok := any(m.HookVerifier()).(T); ok {
+				hooks = append(hooks, h)
+			}
 		default:
-			var found bool
 			for name, m := range m.injectedSelfserviceHooks {
 				if name == h.Name {
-					i = append(i, m(h))
-					found = true
-					break
+					if h, ok := m(h).(T); ok {
+						hooks = append(hooks, h)
+					}
+					continue allHooksLoop
 				}
-			}
-			if found {
-				continue
 			}
 			m.l.
 				WithField("for", credentialsType).
 				WithField("hook", h.Name).
-				Errorf("A unknown hook was requested and can therefore not be used")
+				Warn("A configuration for a non-existing hook was found and will be ignored.")
 		}
 	}
 	if addSessionIssuer {
-		i = append(i, m.HookSessionIssuer())
+		if h, ok := any(m.HookSessionIssuer()).(T); ok {
+			hooks = append(hooks, h)
+		}
 	}
 
-	return i
+	return hooks, nil
 }

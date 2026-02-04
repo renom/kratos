@@ -48,7 +48,6 @@ func (g *ProviderLark) Config() *Configuration {
 }
 
 func (g *ProviderLark) OAuth2(ctx context.Context) (*oauth2.Config, error) {
-
 	return &oauth2.Config{
 		ClientID:     g.config.ClientID,
 		ClientSecret: g.config.ClientSecret,
@@ -57,7 +56,6 @@ func (g *ProviderLark) OAuth2(ctx context.Context) (*oauth2.Config, error) {
 		Scopes:      g.config.Scope,
 		RedirectURL: g.config.Redir(g.reg.Config().OIDCRedirectURIBase(ctx)),
 	}, nil
-
 }
 
 func (g *ProviderLark) Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error) {
@@ -85,22 +83,22 @@ func (g *ProviderLark) Claims(ctx context.Context, exchange *oauth2.Token, query
 
 	req, err := retryablehttp.NewRequest("GET", larkUserEndpoint, nil)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	exchange.SetAuthHeader(req.Request)
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	if err := logUpstreamError(g.reg.Logger(), res); err != nil {
 		return nil, err
 	}
 
 	if err := json.NewDecoder(res.Body).Decode(&user); err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	return &Claims{

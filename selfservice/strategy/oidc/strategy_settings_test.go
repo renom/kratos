@@ -10,36 +10,34 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/ory/x/snapshotx"
-
-	"github.com/ory/kratos/driver"
-	kratos "github.com/ory/kratos/internal/httpclient"
-	"github.com/ory/kratos/ui/container"
-	"github.com/ory/kratos/ui/node"
-
-	"github.com/ory/kratos/corpx"
 
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/ory/x/sqlxx"
-
+	"github.com/ory/kratos/corpx"
+	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/settings"
-
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
 	"github.com/ory/kratos/selfservice/strategy/oidc"
+	"github.com/ory/kratos/ui/container"
+	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/snapshotx"
+	"github.com/ory/x/sqlxx"
 )
 
 func init() {
@@ -52,33 +50,33 @@ func TestSettingsStrategy(t *testing.T) {
 		t.Skip()
 	}
 
-	var (
-		conf, reg = internal.NewFastRegistryWithMocks(t)
-		subject   string
-		claims    idTokenClaims
-		scope     []string
+	conf, reg := internal.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/settings.schema.json")),
+		configx.WithValue(config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/kratos"),
 	)
 
+	var (
+		subject string
+		claims  idTokenClaims
+		scope   []string
+	)
 	remoteAdmin, remotePublic, _ := newHydra(t, &subject, &claims, &scope)
 	uiTS := newUI(t, reg)
 	errTS := testhelpers.NewErrorTestServer(t, reg)
-	publicTS, adminTS := testhelpers.NewKratosServers(t)
+	publicTS, _ := testhelpers.NewKratosServer(t, reg)
 
-	orgSSO := newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "org-sso")
-	orgSSO.OrganizationID = "org-1"
 	viperSetProviderConfig(
 		t,
 		conf,
 		newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "ory", func(c *oidc.Configuration) {
 			c.Label = "Ory"
 		}),
+		newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "ory-sso", func(c *oidc.Configuration) {
+			c.OrganizationID = "org-1"
+		}),
 		newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "google"),
 		newOIDCProvider(t, publicTS, remotePublic, remoteAdmin, "github"),
-		orgSSO,
 	)
-	testhelpers.InitKratosServers(t, reg, publicTS, adminTS)
-	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/settings.schema.json")
-	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/kratos")
 
 	// Make test data for this test run unique
 	testID := x.NewUUID().String()
@@ -136,8 +134,8 @@ func TestSettingsStrategy(t *testing.T) {
 	agents := testhelpers.AddAndLoginIdentities(t, reg, publicTS, users)
 
 	newProfileFlow := func(t *testing.T, client *http.Client, redirectTo string, exp time.Duration) *settings.Flow {
-		req, err := reg.SettingsFlowPersister().GetSettingsFlow(context.Background(),
-			x.ParseUUID(string(testhelpers.InitializeSettingsFlowViaBrowser(t, client, false, publicTS).Id)))
+		req, err := reg.SettingsFlowPersister().GetSettingsFlow(t.Context(),
+			x.ParseUUID(testhelpers.InitializeSettingsFlowViaBrowser(t, client, false, publicTS).Id))
 		require.NoError(t, err)
 		assert.Empty(t, req.Active)
 
@@ -228,7 +226,7 @@ func TestSettingsStrategy(t *testing.T) {
 		} {
 			t.Run("agent="+tc.agent, func(t *testing.T) {
 				rs := nprSDK(t, agents[tc.agent], "", time.Hour)
-				snapshotx.SnapshotTExcept(t, rs.Ui.Nodes, []string{"0.attributes.value", "1.attributes.value"})
+				snapshotx.SnapshotT(t, rs.Ui.Nodes, snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 			})
 		}
 	})
@@ -278,7 +276,7 @@ func TestSettingsStrategy(t *testing.T) {
 		unlink := func(t *testing.T, agent, provider string) (body []byte, res *http.Response, req *kratos.SettingsFlow) {
 			req = nprSDK(t, agents[agent], "", time.Hour)
 			body, res = testhelpers.HTTPPostForm(t, agents[agent], action(req),
-				&url.Values{"csrf_token": {x.FakeCSRFToken}, "unlink": {provider}})
+				&url.Values{"csrf_token": {nosurfx.FakeCSRFToken}, "unlink": {provider}})
 			return
 		}
 
@@ -338,9 +336,9 @@ func TestSettingsStrategy(t *testing.T) {
 				lf, _, err := fa.GetLoginFlow(context.Background()).Id(res.Request.URL.Query()["flow"][0]).Execute()
 				require.NoError(t, err)
 
-				for _, node := range lf.Ui.Nodes {
-					if node.Group == "oidc" && node.Attributes.UiNodeInputAttributes.Name == "provider" {
-						assert.Contains(t, []string{"ory", "github"}, node.Attributes.UiNodeInputAttributes.Value)
+				for _, n := range lf.Ui.Nodes {
+					if n.Group == "oidc" && n.Attributes.UiNodeInputAttributes.Name == "provider" {
+						assert.Contains(t, []string{"ory", "github"}, n.Attributes.UiNodeInputAttributes.Value)
 					}
 				}
 
@@ -364,7 +362,7 @@ func TestSettingsStrategy(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, time.Minute*5)
 
 				body, res := testhelpers.HTTPPostForm(t, agents[agent], action(req),
-					&url.Values{"csrf_token": {x.FakeCSRFToken}, "unlink": {provider}})
+					&url.Values{"csrf_token": {nosurfx.FakeCSRFToken}, "unlink": {provider}})
 				assert.Contains(t, res.Request.URL.String(), uiTS.URL+"/settings?flow="+req.Id)
 
 				assert.Equal(t, "success", gjson.GetBytes(body, "state").String())
@@ -378,7 +376,7 @@ func TestSettingsStrategy(t *testing.T) {
 		link := func(t *testing.T, agent, provider string) (body []byte, res *http.Response, req *kratos.SettingsFlow) {
 			req = nprSDK(t, agents[agent], "", time.Hour)
 			body, res = testhelpers.HTTPPostForm(t, agents[agent], action(req),
-				&url.Values{"csrf_token": {x.FakeCSRFToken}, "link": {provider}})
+				&url.Values{"csrf_token": {nosurfx.FakeCSRFToken}, "link": {provider}})
 			return
 		}
 
@@ -391,7 +389,7 @@ func TestSettingsStrategy(t *testing.T) {
 				assert.Contains(t, gjson.GetBytes(body, "ui.action").String(), publicTS.URL+settings.RouteSubmitFlow+"?flow=")
 
 				// The original options to link google and github are still there
-				snapshotx.SnapshotTExcept(t, json.RawMessage(gjson.GetBytes(body, `ui.nodes`).Raw), []string{"0.attributes.value", "1.attributes.value"})
+				snapshotx.SnapshotT(t, json.RawMessage(gjson.GetBytes(body, `ui.nodes`).Raw), snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 
 				assert.Contains(t, gjson.GetBytes(body, `ui.messages.0.text`).String(),
 					"can not link unknown or already existing OpenID Connect connection")
@@ -406,9 +404,9 @@ func TestSettingsStrategy(t *testing.T) {
 
 		t.Run("case=should not be able to link a connection already linked by another identity", func(t *testing.T) {
 			// While this theoretically allows for account enumeration - because we see an error indicator if an
-			// oidc connection is being linked that exists already - it would require the attacker to already
+			// OIDC connection is being linked that exists already - it would require the attacker to already
 			// have control over the social profile, in which case account enumeration is the least of our worries.
-			// Instead of using the oidc profile for enumeration, the attacker would use it for account takeover.
+			// Instead of using the OIDC profile for enumeration, the attacker would use it for account takeover.
 
 			// This is the multiuser login id for google
 			subject = "hackerman+multiuser+" + testID
@@ -465,16 +463,44 @@ func TestSettingsStrategy(t *testing.T) {
 			require.EqualValues(t, flow.StateSuccess, updatedFlowSDK.State)
 
 			t.Run("flow=original", func(t *testing.T) {
-				snapshotx.SnapshotTExcept(t, originalFlow.Ui.Nodes, []string{"0.attributes.value", "1.attributes.value"})
+				snapshotx.SnapshotT(t, originalFlow.Ui.Nodes, snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 			})
 			t.Run("flow=response", func(t *testing.T) {
-				snapshotx.SnapshotTExcept(t, json.RawMessage(gjson.GetBytes(updatedFlow, "ui.nodes").Raw), []string{"0.attributes.value", "1.attributes.value"})
+				snapshotx.SnapshotT(t, json.RawMessage(gjson.GetBytes(updatedFlow, "ui.nodes").Raw), snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 			})
 			t.Run("flow=fetch", func(t *testing.T) {
-				snapshotx.SnapshotTExcept(t, updatedFlowSDK.Ui.Nodes, []string{"0.attributes.value", "1.attributes.value"})
+				snapshotx.SnapshotT(t, updatedFlowSDK.Ui.Nodes, snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 			})
 
 			checkCredentials(t, true, users[agent].ID, provider, subject, true)
+		})
+
+		t.Run("case=should link a connection and add auth method to session", func(t *testing.T) {
+			t.Cleanup(reset(t))
+
+			scope = []string{"openid", "offline"}
+
+			agent, provider := "githuber", "google"
+			_, res, _ := link(t, agent, provider)
+			assert.Contains(t, res.Request.URL.String(), uiTS.URL)
+
+			// Get the specific session for this agent using SDK
+			sess, _, err := testhelpers.NewSDKCustomClient(publicTS, agents[agent]).
+				FrontendAPI.
+				ToSession(context.Background()).
+				Execute()
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+
+			// Check that the session has the expected auth method
+			found := slices.ContainsFunc(sess.AuthenticationMethods, func(am kratos.SessionAuthenticationMethod) bool {
+				return am.Method != nil &&
+					am.Provider != nil &&
+					*am.Method == string(identity.CredentialsTypeOIDC) &&
+					*am.Provider == provider
+			})
+
+			require.True(t, found, "session should contain OIDC auth method for provider %s", provider)
 		})
 
 		t.Run("case=should link a connection even if user does not have oidc credentials yet", func(t *testing.T) {
@@ -491,7 +517,7 @@ func TestSettingsStrategy(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, flow.StateSuccess, rs.State)
 
-			snapshotx.SnapshotTExcept(t, rs.Ui.Nodes, []string{"0.attributes.value", "1.attributes.value"})
+			snapshotx.SnapshotT(t, rs.Ui.Nodes, snapshotx.ExceptPaths("0.attributes.value", "1.attributes.value"))
 
 			checkCredentials(t, true, users[agent].ID, provider, subject, true)
 		})
@@ -516,7 +542,7 @@ func TestSettingsStrategy(t *testing.T) {
 				}
 
 				values := &url.Values{}
-				values.Set("csrf_token", x.FakeCSRFToken)
+				values.Set("csrf_token", nosurfx.FakeCSRFToken)
 				values.Set("link", provider)
 				values.Set("upstream_parameters.login_hint", "foo@bar.com")
 				values.Set("upstream_parameters.hd", "bar.com")
@@ -545,7 +571,7 @@ func TestSettingsStrategy(t *testing.T) {
 				}
 
 				values := &url.Values{}
-				values.Set("csrf_token", x.FakeCSRFToken)
+				values.Set("csrf_token", nosurfx.FakeCSRFToken)
 				values.Set("link", provider)
 				values.Set("upstream_parameters.lol", "invalid")
 
@@ -575,9 +601,9 @@ func TestSettingsStrategy(t *testing.T) {
 				lf, _, err := fa.GetLoginFlow(context.Background()).Id(res.Request.URL.Query()["flow"][0]).Execute()
 				require.NoError(t, err)
 
-				for _, node := range lf.Ui.Nodes {
-					if node.Group == "oidc" && node.Attributes.UiNodeInputAttributes.Name == "provider" {
-						assert.Contains(t, []string{"ory", "github"}, node.Attributes.UiNodeInputAttributes.Value)
+				for _, n := range lf.Ui.Nodes {
+					if n.Group == "oidc" && n.Attributes.UiNodeInputAttributes.Name == "provider" {
+						assert.Contains(t, []string{"ory", "github"}, n.Attributes.UiNodeInputAttributes.Value)
 					}
 				}
 
@@ -601,7 +627,7 @@ func TestSettingsStrategy(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, time.Minute*5)
 
 				body, res := testhelpers.HTTPPostForm(t, agents[agent], action(req),
-					&url.Values{"csrf_token": {x.FakeCSRFToken}, "unlink": {provider}})
+					&url.Values{"csrf_token": {nosurfx.FakeCSRFToken}, "unlink": {provider}})
 				assert.Contains(t, res.Request.URL.String(), uiTS.URL+"/settings?flow="+req.Id)
 
 				assert.Equal(t, "success", gjson.GetBytes(body, "state").String())
@@ -618,10 +644,10 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		_, reg := internal.NewFastRegistryWithMocks(t)
 		ctx := context.Background()
 		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://stub/registration.schema.json")
-		ctx = confighelpers.WithConfigValue(ctx, config.ViperKeyPublicBaseURL, "https://www.ory.sh/")
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeyPublicBaseURL, "https://www.ory.sh/")
 		baseKey := fmt.Sprintf("%s.%s", config.ViperKeySelfServiceStrategyConfig, identity.CredentialsTypeOIDC)
 
-		ctx = confighelpers.WithConfigValues(ctx, map[string]interface{}{
+		ctx = contextx.WithConfigValues(ctx, map[string]interface{}{
 			baseKey + ".enabled": true,
 			baseKey + ".config":  conf,
 		})
@@ -645,7 +671,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 	populate := func(t *testing.T, reg *driver.RegistryDefault, ctx context.Context, i *identity.Identity, f *settings.Flow) *container.Container {
 		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(ctx, i))
 		req := new(http.Request)
-		require.NoError(t, ns(t, reg, ctx).PopulateSettingsMethod(req.WithContext(ctx), i, f))
+		require.NoError(t, ns(t, reg, ctx).PopulateSettingsMethod(ctx, req, i, f))
 		require.NotNil(t, f.UI)
 		require.NotNil(t, f.UI.Nodes)
 		assert.Equal(t, "POST", f.UI.Method)
@@ -665,7 +691,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(ctx, i))
 		f := &settings.Flow{Type: flow.TypeAPI, ID: x.NewUUID(), UI: container.New("")}
 		req := new(http.Request)
-		require.NoError(t, ns(t, reg, ctx).PopulateSettingsMethod(req.WithContext(ctx), i, f))
+		require.NoError(t, ns(t, reg, ctx).PopulateSettingsMethod(ctx, req, i, f))
 		require.Empty(t, f.UI.Nodes)
 	})
 
@@ -678,7 +704,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		{
 			c: []oidc.Configuration{},
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 			},
 		},
 		{
@@ -686,14 +712,14 @@ func TestPopulateSettingsMethod(t *testing.T) {
 				{Provider: "generic", ID: "github"},
 			},
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("github", "github"),
 			},
 		},
 		{
 			c: defaultConfig,
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("facebook", "facebook"),
 				oidc.NewLinkNode("google", "google"),
 				oidc.NewLinkNode("github", "github"),
@@ -702,7 +728,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		{
 			c: defaultConfig,
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("facebook", "facebook"),
 				oidc.NewLinkNode("google", "google"),
 				oidc.NewLinkNode("github", "github"),
@@ -712,7 +738,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		{
 			c: defaultConfig,
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("facebook", "facebook"),
 				oidc.NewLinkNode("github", "github"),
 			},
@@ -723,7 +749,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		{
 			c: defaultConfig,
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("facebook", "facebook"),
 				oidc.NewLinkNode("github", "github"),
 				oidc.NewUnlinkNode("google", "google"),
@@ -739,7 +765,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 		{
 			c: defaultConfig,
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("github", "github"),
 				oidc.NewUnlinkNode("google", "google"),
 				oidc.NewUnlinkNode("facebook", "facebook"),
@@ -757,7 +783,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 				{Provider: "generic", ID: "labeled", Label: "Labeled"},
 			},
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewLinkNode("labeled", "Labeled"),
 			},
 		},
@@ -767,7 +793,7 @@ func TestPopulateSettingsMethod(t *testing.T) {
 				{Provider: "generic", ID: "facebook"},
 			},
 			e: node.Nodes{
-				node.NewCSRFNode(x.FakeCSRFToken),
+				node.NewCSRFNode(nosurfx.FakeCSRFToken),
 				oidc.NewUnlinkNode("labeled", "Labeled"),
 				oidc.NewUnlinkNode("facebook", "facebook"),
 			},

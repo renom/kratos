@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/pkg/errors"
 
 	"github.com/ory/kratos/continuity"
@@ -27,8 +29,8 @@ import (
 type strategyDependencies interface {
 	x.LoggingProvider
 	x.WriterProvider
-	x.CSRFTokenGeneratorProvider
-	x.CSRFProvider
+	nosurfx.CSRFTokenGeneratorProvider
+	nosurfx.CSRFProvider
 	x.TracingProvider
 
 	config.Provider
@@ -75,9 +77,9 @@ type Strategy struct {
 	hd *decoderx.HTTP
 }
 
-func NewStrategy(d any) *Strategy {
+func NewStrategy(d strategyDependencies) *Strategy {
 	return &Strategy{
-		d:  d.(strategyDependencies),
+		d:  d,
 		hd: decoderx.NewHTTP(),
 	}
 }

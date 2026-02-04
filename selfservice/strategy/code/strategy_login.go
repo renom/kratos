@@ -9,31 +9,28 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-
-	"go.opentelemetry.io/otel/attribute"
-
-	"github.com/ory/kratos/driver/config"
-
-	"github.com/ory/kratos/selfservice/strategy/idfirst"
-	"github.com/ory/kratos/text"
-
-	"github.com/ory/x/sqlcon"
+	"time"
 
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/ory/herodot"
-	"github.com/ory/x/otelx"
-
-	"github.com/samber/lo"
-
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
+	"github.com/ory/kratos/selfservice/strategy/idfirst"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/decoderx"
+	"github.com/ory/x/otelx"
+	"github.com/ory/x/pointerx"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/sqlxx"
 )
 
 var (
@@ -93,7 +90,7 @@ func (s *Strategy) CompletedAuthenticationMethod(ctx context.Context) session.Au
 	}
 }
 
-func (s *Strategy) HandleLoginError(r *http.Request, f *login.Flow, body *updateLoginFlowWithCodeMethod, err error) error {
+func (s *Strategy) HandleLoginError(r *http.Request, f *login.Flow, body *updateLoginFlowWithCodeMethod, err error, hideIdentifier bool) error {
 	if errors.Is(err, flow.ErrCompletedByStrategy) {
 		return err
 	}
@@ -105,10 +102,13 @@ func (s *Strategy) HandleLoginError(r *http.Request, f *login.Flow, body *update
 		}
 
 		f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
-		identifierNode := node.NewInputField("identifier", identifier, node.DefaultGroup, node.InputAttributeTypeHidden)
+		if hideIdentifier {
+			identifierNode := node.NewInputField("identifier", identifier, node.DefaultGroup, node.InputAttributeTypeHidden)
+			identifierNode.Attributes.SetValue(identifier)
+			f.UI.GetNodes().Upsert(identifierNode)
+		}
 
-		identifierNode.Attributes.SetValue(identifier)
-		f.UI.GetNodes().Upsert(identifierNode)
+		f.UI.Nodes.SetValueAttribute("identifier", identifier)
 	}
 
 	return err
@@ -119,7 +119,7 @@ func (s *Strategy) HandleLoginError(r *http.Request, f *login.Flow, body *update
 // the identity through other credentials matching the identifier.
 // the fallback mechanism is used for migration purposes of old accounts that do not have a code credential.
 func (s *Strategy) findIdentityByIdentifier(ctx context.Context, identifier string) (id *identity.Identity, cred *identity.Credentials, isFallback bool, err error) {
-	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.strategy.findIdentityByIdentifier")
+	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.Strategy.findIdentityByIdentifier")
 	defer otelx.End(span, &err)
 
 	id, cred, err = s.deps.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, s.ID(), identifier)
@@ -214,13 +214,13 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		decoderx.MustHTTPRawJSONSchemaCompiler(loginMethodSchema),
 		decoderx.HTTPDecoderAllowedMethods("POST"),
 		decoderx.HTTPDecoderJSONFollowsFormFormat()); err != nil {
-		return nil, s.HandleLoginError(r, f, &p, err)
+		return nil, s.HandleLoginError(r, f, &p, err, false)
 	}
 
 	f.TransientPayload = p.TransientPayload
 
 	if err := flow.EnsureCSRF(s.deps, r, f.Type, s.deps.Config().DisableAPIFlowEnforcement(ctx), s.deps.GenerateCSRFToken, p.CSRFToken); err != nil {
-		return nil, s.HandleLoginError(r, f, &p, err)
+		return nil, s.HandleLoginError(r, f, &p, err, false)
 	}
 
 	// By Default the flow should be in the 'choose method' state.
@@ -229,20 +229,20 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	switch f.GetState() {
 	case flow.StateChooseMethod:
 		if err := s.loginSendCode(ctx, w, r, f, &p, sess); err != nil {
-			return nil, s.HandleLoginError(r, f, &p, err)
+			return nil, s.HandleLoginError(r, f, &p, err, false)
 		}
 		return nil, nil
 	case flow.StateEmailSent:
 		i, err := s.loginVerifyCode(ctx, f, &p, sess)
 		if err != nil {
-			return nil, s.HandleLoginError(r, f, &p, err)
+			return nil, s.HandleLoginError(r, f, &p, err, true)
 		}
 		return i, nil
 	case flow.StatePassedChallenge:
-		return nil, s.HandleLoginError(r, f, &p, errors.WithStack(schema.NewNoLoginStrategyResponsible()))
+		return nil, s.HandleLoginError(r, f, &p, errors.WithStack(schema.NewNoLoginStrategyResponsible()), false)
 	}
 
-	return nil, s.HandleLoginError(r, f, &p, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unexpected flow state: %s", f.GetState())))
+	return nil, s.HandleLoginError(r, f, &p, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unexpected flow state: %s", f.GetState())), false)
 }
 
 func (s *Strategy) findIdentifierInVerifiableAddress(i *identity.Identity, identifier string) (*Address, error) {
@@ -267,7 +267,7 @@ func (s *Strategy) findIdentifierInVerifiableAddress(i *identity.Identity, ident
 }
 
 func (s *Strategy) findIdentityForIdentifier(ctx context.Context, identifier string, requestedAAL identity.AuthenticatorAssuranceLevel, session *session.Session) (_ *identity.Identity, _ []Address, err error) {
-	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.strategy.findIdentityForIdentifier")
+	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.Strategy.findIdentityForIdentifier")
 	span.SetAttributes(
 		attribute.String("flow.requested_aal", string(requestedAAL)),
 	)
@@ -290,7 +290,7 @@ func (s *Strategy) findIdentityForIdentifier(ctx context.Context, identifier str
 			// we need to gracefully handle this flow.
 			//
 			// TODO this section should be removed at some point when we are sure that all identities have a code credential.
-			if codeCred := new(schema.ValidationError); errors.As(err, &codeCred) && codeCred.ValidationError.Message == "account does not exist or has not setup up sign in with code" {
+			if codeCred := new(schema.ValidationError); errors.As(err, &codeCred) && codeCred.Message == "account does not exist or has not setup up sign in with code" {
 				fallbackAllowed := s.deps.Config().SelfServiceCodeMethodMissingCredentialFallbackEnabled(ctx)
 				span.SetAttributes(
 					attribute.Bool(config.ViperKeyCodeConfigMissingCredentialFallbackEnabled, fallbackAllowed),
@@ -379,7 +379,7 @@ func (s *Strategy) findIdentityForIdentifier(ctx context.Context, identifier str
 }
 
 func (s *Strategy) loginSendCode(ctx context.Context, w http.ResponseWriter, r *http.Request, f *login.Flow, p *updateLoginFlowWithCodeMethod, sess *session.Session) (err error) {
-	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.strategy.loginSendCode")
+	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.Strategy.loginSendCode")
 	defer otelx.End(span, &err)
 
 	p.Identifier = maybeNormalizeEmail(
@@ -440,7 +440,7 @@ func maybeNormalizeEmail(input string) string {
 }
 
 func (s *Strategy) loginVerifyCode(ctx context.Context, f *login.Flow, p *updateLoginFlowWithCodeMethod, sess *session.Session) (_ *identity.Identity, err error) {
-	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.strategy.loginVerifyCode")
+	ctx, span := s.deps.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.code.Strategy.loginVerifyCode")
 	defer otelx.End(span, &err)
 
 	// we are in the second submission state of the flow
@@ -494,16 +494,18 @@ func (s *Strategy) loginVerifyCode(ctx context.Context, f *login.Flow, p *update
 	if err := s.verifyAddress(ctx, i, Address{
 		To:  loginCode.Address,
 		Via: loginCode.AddressType,
-	}); err != nil {
+	}, true); err != nil {
 		return nil, err
 	}
 
+	verifiedAt := sqlxx.NullTime(time.Now().UTC())
 	for idx := range i.VerifiableAddresses {
 		va := i.VerifiableAddresses[idx]
 		if !va.Verified && loginCode.Address == va.Value {
 			va.Verified = true
+			va.VerifiedAt = &verifiedAt
 			va.Status = identity.VerifiableAddressStatusCompleted
-			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, &va); err != nil {
+			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, &va, "verified", "verified_at", "status"); err != nil {
 				return nil, err
 			}
 			break
@@ -513,32 +515,37 @@ func (s *Strategy) loginVerifyCode(ctx context.Context, f *login.Flow, p *update
 	return i, nil
 }
 
-func (s *Strategy) verifyAddress(ctx context.Context, i *identity.Identity, verified Address) error {
+func (s *Strategy) verifyAddress(ctx context.Context, i *identity.Identity, verified Address, persistNow bool) error {
 	for idx := range i.VerifiableAddresses {
-		va := i.VerifiableAddresses[idx]
-		if va.Verified {
+		address := &i.VerifiableAddresses[idx]
+		if address.Verified {
 			continue
 		}
 
-		if verified.To != va.Value || string(verified.Via) != va.Via {
+		if verified.To != address.Value || string(verified.Via) != address.Via {
 			continue
 		}
 
-		va.Verified = true
-		va.Status = identity.VerifiableAddressStatusCompleted
-		if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, &va); errors.Is(err, sqlcon.ErrNoRows) {
-			// This happens when the verified address does not yet exist, for example during registration. In this case we just skip.
-			continue
-		} else if err != nil {
-			return err
+		address.Verified = true
+		address.VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
+		address.Status = identity.VerifiableAddressStatusCompleted
+		if persistNow {
+			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, address, "verified", "verified_at", "status"); errors.Is(err, sqlcon.ErrNoRows) {
+				// This happens when the verified address does not yet exist, for example during registration. In this case we just skip.
+				s.deps.Logger().WithError(err).Warnf("Could not update verifiable address for identity %s.", i.ID)
+				continue
+			} else if err != nil {
+				return err
+			}
 		}
+		i.VerifiableAddresses[idx] = *address
 		break
 	}
 
 	return nil
 }
 
-func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, f *login.Flow) error {
+func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, f *login.Flow, _ *session.Session) error {
 	return s.PopulateMethod(r, f)
 }
 

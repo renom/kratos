@@ -5,55 +5,54 @@ package embedx
 
 import (
 	"bytes"
+	_ "embed"
 	"io"
 
 	"github.com/pkg/errors"
-
-	"github.com/ory/x/otelx"
-
 	"github.com/tidwall/gjson"
 
-	_ "embed"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/otelx"
 )
 
 //go:embed config.schema.json
-var ConfigSchema string
+var ConfigSchema []byte
 
 //go:embed identity_meta.schema.json
-var IdentityMetaSchema string
+var IdentityMetaSchema []byte
 
 //go:embed identity_extension.schema.json
-var IdentityExtensionSchema string
+var IdentityExtensionSchema []byte
 
 type SchemaType int
 
 const (
-	Config SchemaType = iota
+	Config SchemaType = iota + 1
 	IdentityMeta
 	IdentityExtension
 )
 
 type Schema struct {
 	id           string
-	data         string
+	data         []byte
 	dependencies []*Schema
 }
 
 var (
 	identityExt = &Schema{
-		id:           gjson.Get(IdentityExtensionSchema, "$id").Str,
+		id:           gjson.GetBytes(IdentityExtensionSchema, "$id").Str,
 		data:         IdentityExtensionSchema,
 		dependencies: nil,
 	}
 
 	schemas = map[SchemaType]*Schema{
 		Config: {
-			id:           gjson.Get(ConfigSchema, "$id").Str,
+			id:           gjson.GetBytes(ConfigSchema, "$id").Str,
 			data:         ConfigSchema,
 			dependencies: nil,
 		},
 		IdentityMeta: {
-			id:   gjson.Get(IdentityMetaSchema, "$id").Str,
+			id:   gjson.GetBytes(IdentityMetaSchema, "$id").Str,
 			data: IdentityMetaSchema,
 			dependencies: []*Schema{
 				identityExt,
@@ -97,14 +96,14 @@ func AddSchemaResources(c interface {
 		return err
 	}
 
-	return nil
+	return configx.AddSchemaResources(c)
 }
 
 func addSchemaResources(c interface {
 	AddResource(url string, r io.Reader) error
 }, schemas []*Schema) error {
 	for _, s := range schemas {
-		if err := c.AddResource(s.id, bytes.NewBufferString(s.data)); err != nil {
+		if err := c.AddResource(s.id, bytes.NewReader(s.data)); err != nil {
 			return errors.WithStack(err)
 		}
 		if s.dependencies != nil {

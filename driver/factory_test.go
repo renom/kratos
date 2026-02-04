@@ -7,8 +7,7 @@ import (
 	"context"
 	"os"
 	"testing"
-
-	"github.com/ory/x/servicelocatorx"
+	"time"
 
 	"github.com/gofrs/uuid"
 
@@ -26,16 +25,16 @@ func TestDriverNew(t *testing.T) {
 	r, err := driver.New(
 		context.Background(),
 		os.Stderr,
-		servicelocatorx.NewOptions(),
-		nil,
-		[]configx.OptionModifier{
+		driver.WithConfigOptions(
 			configx.WithValue(config.ViperKeyDSN, config.DefaultSQLiteMemoryDSN),
 			configx.SkipValidation(),
-		})
+		))
 	require.NoError(t, err)
 
 	assert.EqualValues(t, config.DefaultSQLiteMemoryDSN, r.Config().DSN(ctx))
-	require.NoError(t, r.Persister().Ping())
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(cancel)
+	require.NoError(t, r.Persister().Ping(pingCtx))
 
 	assert.NotEqual(t, uuid.Nil.String(), r.Persister().NetworkID(context.Background()).String())
 

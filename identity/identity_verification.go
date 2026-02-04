@@ -108,15 +108,7 @@ func (a VerifiableAddress) GetID() uuid.UUID {
 	return a.ID
 }
 
-func (a VerifiableAddress) GetNID() uuid.UUID {
-	return a.NID
-}
-
-func (a VerifiableAddress) ValidateNID() error {
-	return nil
-}
-
-// Hash returns a unique string representation for the recovery address.
-func (a VerifiableAddress) Hash() string {
+// Signature returns a unique string representation for the recovery address.
+func (a VerifiableAddress) Signature() string {
 	return fmt.Sprintf("%v|%v|%v|%v|%v|%v|%v", a.Value, a.Verified, a.Via, a.Status, a.VerifiedAt, a.IdentityID, a.NID)
 }

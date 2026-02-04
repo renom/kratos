@@ -41,6 +41,7 @@ func NewHasherArgon2(c Argon2Configuration) *Argon2 {
 }
 
 func toKB(mem bytesize.ByteSize) uint32 {
+	//nolint:gosec // disable G115
 	return uint32(mem / bytesize.KB)
 }
 
@@ -56,6 +57,11 @@ func (h *Argon2) Generate(ctx context.Context, password []byte) ([]byte, error) 
 	salt := make([]byte, conf.SaltLength)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
+	}
+
+	// ensure that the context is not canceled before doing the heavy lifting
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	// Pass the plaintext password, salt and parameters to the argon2.IDKey

@@ -50,7 +50,7 @@ func (s *Strategy) populateLoginMethodForPasskeys(r *http.Request, loginFlow *lo
 
 	loginFlow.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := loginFlow.IdentitySchema.URL(r.Context(), s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -89,7 +89,9 @@ func (s *Strategy) populateLoginMethodForPasskeys(r *http.Request, loginFlow *lo
 		node.DefaultGroup,
 		node.InputAttributeTypeText,
 		node.WithRequiredInputAttribute,
-		func(attributes *node.InputAttributes) { attributes.Autocomplete = "username webauthn" },
+		func(attributes *node.InputAttributes) {
+			attributes.Autocomplete = node.InputAttributeAutocompleteUsernameWebauthn
+		},
 	).WithMetaLabel(identifierLabel))
 
 	loginFlow.UI.Nodes.Upsert(&node.Node{
@@ -150,7 +152,7 @@ type updateLoginFlowWithPasskeyMethod struct {
 }
 
 func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, _ *session.Session) (i *identity.Identity, err error) {
-	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.passkey.strategy.Login")
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.passkey.Strategy.Login")
 	defer otelx.End(span, &err)
 
 	if f.Type != flow.TypeBrowser {
@@ -248,9 +250,9 @@ func (s *Strategy) loginAuthenticate(ctx context.Context, r *http.Request, f *lo
 	}
 	err = s.d.PrivilegedIdentityPool().HydrateIdentityAssociations(ctx, i, identity.ExpandCredentials)
 	if err != nil {
-		return nil, s.handleLoginError(r, f, errors.WithStack(herodot.ErrInternalServerError.
+		return nil, s.handleLoginError(r, f, x.WrapWithIdentityIDError(errors.WithStack(herodot.ErrInternalServerError.
 			WithReason("Could not load identity credentials").
-			WithWrap(err)))
+			WithWrap(err)), i.ID))
 	}
 
 	c, ok := i.GetCredentials(credentialType)
@@ -260,37 +262,36 @@ func (s *Strategy) loginAuthenticate(ctx context.Context, r *http.Request, f *lo
 
 	var o identity.CredentialsWebAuthnConfig
 	if err := json.Unmarshal(c.Config, &o); err != nil {
-		return nil, s.handleLoginError(r, f, errors.WithStack(herodot.ErrInternalServerError.
+		return nil, s.handleLoginError(r, f, x.WrapWithIdentityIDError(errors.WithStack(herodot.ErrInternalServerError.
 			WithReason("The WebAuthn credentials could not be decoded properly").
 			WithDebug(err.Error()).
-			WithWrap(err)))
+			WithWrap(err)), i.ID))
 	}
 
-	webAuthCreds := o.Credentials.PasswordlessOnly()
-
+	webAuthCreds := o.Credentials.PasswordlessOnly(&webAuthnResponse.Response.AuthenticatorData.Flags)
 	_, err = web.ValidateDiscoverableLogin(
 		func(rawID, userHandle []byte) (user webauthn.User, err error) {
 			return webauthnx.NewUser(userHandle, webAuthCreds, web.Config), nil
 		}, webAuthnSess, webAuthnResponse)
 	if err != nil {
-		return nil, s.handleLoginError(r, f, errors.WithStack(schema.NewWebAuthnVerifierWrongError("#/")))
+		return nil, s.handleLoginError(r, f, x.WrapWithIdentityIDError(errors.WithStack(schema.NewWebAuthnVerifierWrongError("#/")), i.ID))
 	}
 
 	// Remove the WebAuthn URL from the internal context now that it is set!
 	f.InternalContext, err = sjson.DeleteBytes(f.InternalContext, flow.PrefixInternalContextKey(s.ID(), InternalContextKeySessionData))
 	if err != nil {
-		return nil, s.handleLoginError(r, f, errors.WithStack(err))
+		return nil, s.handleLoginError(r, f, x.WrapWithIdentityIDError(errors.WithStack(err), i.ID))
 	}
 
 	f.Active = s.ID()
 	if err = s.d.LoginFlowPersister().UpdateLoginFlow(ctx, f); err != nil {
-		return nil, s.handleLoginError(r, f, errors.WithStack(herodot.ErrInternalServerError.WithReason("Could not update flow").WithDebug(err.Error())))
+		return nil, s.handleLoginError(r, f, x.WrapWithIdentityIDError(errors.WithStack(herodot.ErrInternalServerError.WithReason("Could not update flow").WithDebug(err.Error())), i.ID))
 	}
 
 	return i, nil
 }
 
-func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, f *login.Flow) error {
+func (s *Strategy) PopulateLoginMethodFirstFactorRefresh(r *http.Request, f *login.Flow, _ *session.Session) error {
 	if f.Type != flow.TypeBrowser {
 		return nil
 	}

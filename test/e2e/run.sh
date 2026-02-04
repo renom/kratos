@@ -7,8 +7,6 @@ set -euxo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 make .bin/hydra
-make .bin/yq
-make .bin/modd
 
 export PATH=.bin:$PATH
 export KRATOS_PUBLIC_URL=http://localhost:4433/
@@ -55,7 +53,6 @@ for i in "$@"; do
 done
 
 cleanup() {
-    killall node || true
     killall modd || true
     killall webhook || true
     killall hydra || true
@@ -70,18 +67,18 @@ prepare() {
     cleanup
   fi
 
-  if [ -z ${TEST_DATABASE_POSTGRESQL+x} ]; then
+  if [ -z ${TEST_DATABASE_POSTGRESQL-} ]; then
     docker rm -f kratos_test_database_mysql kratos_test_database_postgres kratos_test_database_cockroach || true
     docker run --name kratos_test_database_mysql -p 3444:3306 -e MYSQL_ROOT_PASSWORD=secret -d mysql:8.0
     docker run --name kratos_test_database_postgres -p 3445:5432 -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=postgres -d postgres:14 postgres -c log_statement=all
-    docker run --name kratos_test_database_cockroach -p 3446:26257 -d cockroachdb/cockroach:v22.2.6 start-single-node --insecure
+    docker run --name kratos_test_database_cockroach -p 3446:26257 -d cockroachdb/cockroach:latest-v25.3 start-single-node --insecure
 
     export TEST_DATABASE_MYSQL="mysql://root:secret@(localhost:3444)/mysql?parseTime=true&multiStatements=true"
     export TEST_DATABASE_POSTGRESQL="postgres://postgres:secret@localhost:3445/postgres?sslmode=disable"
     export TEST_DATABASE_COCKROACHDB="cockroach://root@localhost:3446/defaultdb?sslmode=disable"
   fi
 
-  if [ -z ${NODE_UI_PATH+x} ]; then
+  if [ -z "${NODE_UI_PATH-}" ]; then
     node_ui_dir="$(mktemp -d -t ci-XXXXXXXXXX)/kratos-selfservice-ui-node"
     git clone --depth 1 --branch master https://github.com/ory/kratos-selfservice-ui-node.git "$node_ui_dir"
     (cd "$node_ui_dir" && npm i --legacy-peer-deps && npm run build)
@@ -89,7 +86,7 @@ prepare() {
     node_ui_dir="${NODE_UI_PATH}"
   fi
 
-  if [ -z ${RN_UI_PATH+x} ]; then
+  if [ -z "${RN_UI_PATH-}" ]; then
     rn_ui_dir="$(mktemp -d -t ci-XXXXXXXXXX)/kratos-selfservice-ui-react-native"
     git clone --depth 1 --branch master https://github.com/ory/kratos-selfservice-ui-react-native.git "$rn_ui_dir"
     (cd "$rn_ui_dir" && npm i)
@@ -97,7 +94,7 @@ prepare() {
     rn_ui_dir="${RN_UI_PATH}"
   fi
 
-  if [ -z ${REACT_UI_PATH+x} ]; then
+  if [ -z "${REACT_UI_PATH-}" ]; then
     react_ui_dir="$(mktemp -d -t ci-XXXXXXXXXX)/ory/kratos-selfservice-ui-react-nextjs"
     git clone --depth 1 --branch master https://github.com/ory/kratos-selfservice-ui-react-nextjs.git "$react_ui_dir"
     (cd "$react_ui_dir" && npm i)
@@ -112,7 +109,7 @@ prepare() {
     npm i
   )
 
-  if [ -z ${CI+x} ]; then
+  if [ -z ${CI-} ]; then
     docker rm mailslurper hydra hydra-ui -f || true
     docker run --name mailslurper -p 4436:4436 -p 4437:4437 -p 1025:1025 oryd/mailslurper:latest-smtps > "${base}/test/e2e/mailslurper.e2e.log" 2>&1 &
   fi
@@ -210,7 +207,7 @@ prepare() {
       >"${base}/test/e2e/ui-node.e2e.log" 2>&1 &
   )
 
-  if [ -z ${REACT_UI_PATH+x} ]; then
+  if [ -z "${REACT_UI_PATH-}" ]; then
     (
       cd "$react_ui_dir"
       NEXT_PUBLIC_KRATOS_PUBLIC_URL=http://localhost:4433 npm run build
@@ -253,15 +250,16 @@ run() {
   nc -zv localhost 4433 && (echo "Port 4433 unavailable, used by" ; lsof -i:4433 ; exit 1)
 
   ls -la .
-  for profile in code email mobile oidc recovery recovery-mfa verification mfa spa network passwordless passkey webhooks oidc-provider oidc-provider-mfa two-steps; do
-    yq ea '. as $item ireduce ({}; . * $item )' test/e2e/profiles/kratos.base.yml "test/e2e/profiles/${profile}/.kratos.yml" > test/e2e/kratos.${profile}.yml
+  for profile in code email mobile oidc recovery recovery-mfa verification mfa mfa-optional spa network passwordless passkey webhooks oidc-provider oidc-provider-mfa two-steps; do
+    go tool yq ea '. as $item ireduce ({}; . * $item )' test/e2e/profiles/kratos.base.yml "test/e2e/profiles/${profile}/.kratos.yml" > test/e2e/kratos.${profile}.yml
     cat "test/e2e/kratos.${profile}.yml" | envsubst | sponge "test/e2e/kratos.${profile}.yml"
   done
   cp test/e2e/kratos.email.yml test/e2e/kratos.generated.yml
 
-  (modd -f test/e2e/modd.conf >"${base}/test/e2e/kratos.e2e.log" 2>&1 &)
+  (go tool modd -f test/e2e/modd.conf >"${base}/test/e2e/kratos.e2e.log" 2>&1 &)
 
-  npm run wait-on -- -l -t 300000 http-get://127.0.0.1:4434/health/ready \
+  # Having to wait 10 minutes for cockroach to apply the migrations is ridiculous but sometimes it takes that long in CI
+  npm run wait-on -- -l -t 10m http-get://127.0.0.1:4434/health/ready \
     http-get://127.0.0.1:4444/.well-known/openid-configuration \
     http-get://127.0.0.1:4455/health/ready \
     http-get://127.0.0.1:4445/health/ready \
@@ -276,10 +274,10 @@ run() {
   if [[ $dev == "yes" ]]; then
     (cd test/e2e; npm run test:watch --)
   else
-    if [ -z ${CYPRESS_RECORD_KEY+x} ]; then
-      (cd test/e2e; npm run test --)
+    if [ -z "${CYPRESS_RECORD_KEY-}" ]; then
+      (cd test/e2e; npx cypress run --browser chrome ${CYPRESS_OPTS-})
     else
-      (cd test/e2e; npm run test -- --record --tag "${2}" )
+      (cd test/e2e; npx cypress run --browser chrome ${CYPRESS_OPTS-} --record --tag "${2}" )
     fi
   fi
 }

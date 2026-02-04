@@ -8,7 +8,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
-	"sync"
+	"slices"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -50,8 +50,6 @@ func (lt State) IsValid() error {
 //
 // swagger:model identity
 type Identity struct {
-	l *sync.RWMutex `db:"-" faker:"-"`
-
 	// ID is the identity's unique identifier.
 	//
 	// The Identity ID can not be changed and can not be chosen. This ensures future
@@ -59,6 +57,13 @@ type Identity struct {
 	//
 	// required: true
 	ID uuid.UUID `json:"id" faker:"-" db:"id"`
+
+	// ExternalID is an optional external ID of the identity. This is used to link
+	// the identity to an external system. If set, the external ID must be unique
+	// across all identities.
+	//
+	// required: false
+	ExternalID sqlxx.NullString `json:"external_id,omitempty" faker:"-" db:"external_id"`
 
 	// Credentials represents all credentials that can be used for authenticating this identity.
 	Credentials map[CredentialsType]Credentials `json:"credentials,omitempty" faker:"-" db:"-"`
@@ -151,12 +156,12 @@ func DefaultPageToken() keysetpagination.PageToken {
 // swagger:model identityTraits
 type Traits json.RawMessage
 
-func (t *Traits) Scan(value interface{}) error {
+func (t *Traits) Scan(value any) error {
 	return sqlxx.JSONScan(t, value)
 }
 
 func (t Traits) Value() (driver.Value, error) {
-	return sqlxx.JSONValue(t)
+	return string(t), nil
 }
 
 func (t *Traits) String() string {
@@ -184,31 +189,21 @@ func (i Identity) TableName(context.Context) string {
 	return "identities"
 }
 
-func (i *Identity) lock() *sync.RWMutex {
-	if i.l == nil {
-		i.l = new(sync.RWMutex)
-	}
-	return i.l
-}
-
 func (i *Identity) IsActive() bool {
 	return i.State == StateActive
 }
 
 func (i *Identity) SetCredentials(t CredentialsType, c Credentials) {
-	i.lock().Lock()
-	defer i.lock().Unlock()
 	if i.Credentials == nil {
 		i.Credentials = make(map[CredentialsType]Credentials)
 	}
 
 	c.Type = t
+	c.IdentityID = i.ID
 	i.Credentials[t] = c
 }
 
-func (i *Identity) SetCredentialsWithConfig(t CredentialsType, c Credentials, conf interface{}) (err error) {
-	i.lock().Lock()
-	defer i.lock().Unlock()
+func (i *Identity) SetCredentialsWithConfig(t CredentialsType, c Credentials, conf any) (err error) {
 	if i.Credentials == nil {
 		i.Credentials = make(map[CredentialsType]Credentials)
 	}
@@ -224,8 +219,6 @@ func (i *Identity) SetCredentialsWithConfig(t CredentialsType, c Credentials, co
 }
 
 func (i *Identity) DeleteCredentialsType(t CredentialsType) {
-	i.lock().Lock()
-	defer i.lock().Unlock()
 	if i.Credentials == nil {
 		return
 	}
@@ -270,9 +263,6 @@ func (i *Identity) UpsertCredentialsConfig(t CredentialsType, conf []byte, versi
 }
 
 func (i *Identity) GetCredentials(t CredentialsType) (*Credentials, bool) {
-	i.lock().RLock()
-	defer i.lock().RUnlock()
-
 	if c, ok := i.Credentials[t]; ok {
 		return &c, true
 	}
@@ -280,10 +270,7 @@ func (i *Identity) GetCredentials(t CredentialsType) (*Credentials, bool) {
 	return nil, false
 }
 
-func (i *Identity) ParseCredentials(t CredentialsType, config interface{}) (*Credentials, error) {
-	i.lock().RLock()
-	defer i.lock().RUnlock()
-
+func (i *Identity) ParseCredentials(t CredentialsType, config any) (*Credentials, error) {
 	if c, ok := i.Credentials[t]; ok {
 		if err := json.Unmarshal(c.Config, config); err != nil {
 			return nil, errors.WithStack(err)
@@ -295,12 +282,59 @@ func (i *Identity) ParseCredentials(t CredentialsType, config interface{}) (*Cre
 }
 
 func (i *Identity) CopyWithoutCredentials() *Identity {
-	i.lock().RLock()
-	defer i.lock().RUnlock()
 	ii := *i
-	ii.l = new(sync.RWMutex)
 	ii.Credentials = nil
 	return &ii
+}
+
+// MergeOIDCCredentials merges the new credentials into the existing credentials.
+// If the provider already exists, the provider is replace and the identifier is
+// updated. This function requires the new credentials to have exactly one
+// provider and one identifier, as returned by identity.NewCredentialsOIDC.
+func (i *Identity) MergeOIDCCredentials(t CredentialsType, newCreds Credentials) (err error) {
+	creds, ok := i.Credentials[t]
+	if !ok {
+		i.SetCredentials(t, newCreds)
+		return nil
+	}
+
+	var conf CredentialsOIDC
+	if err = json.Unmarshal(creds.Config, &conf); err != nil {
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to decode old %s credentials from JSON: %s", creds.Config, err))
+	}
+
+	var newConf CredentialsOIDC
+	if err = json.Unmarshal(newCreds.Config, &newConf); err != nil {
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to decode new %s credentials from JSON: %s", newCreds.Config, err))
+	}
+
+	if len(newConf.Providers) != 1 {
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Expected exactly one provider to merge credentials."))
+	}
+	newProvider := newConf.Providers[0]
+
+	// The identifier should have been set already, but we set it here just in case.
+	if len(newCreds.Identifiers) != 1 {
+		newCreds.Identifiers = []string{OIDCUniqueID(newProvider.Provider, newProvider.Subject)}
+	}
+
+	// Delete `use_auto_link` providers and their identifiers
+	var obsoleteIdentifiers []string
+	conf.Providers = slices.DeleteFunc(conf.Providers, func(p CredentialsOIDCProvider) bool {
+		if p.Provider == newProvider.Provider && p.UseAutoLink {
+			obsoleteIdentifiers = append(obsoleteIdentifiers, OIDCUniqueID(p.Provider, p.Subject))
+			return true
+		}
+		return false
+	})
+	creds.Identifiers = slices.DeleteFunc(creds.Identifiers, func(identifier string) bool {
+		return slices.Contains(obsoleteIdentifiers, identifier)
+	})
+
+	creds.Identifiers = append(creds.Identifiers, newCreds.Identifiers...)
+	conf.Providers = append(conf.Providers, newProvider)
+
+	return i.SetCredentialsWithConfig(t, creds, conf)
 }
 
 func NewIdentity(traitsSchemaID string) *Identity {
@@ -317,16 +351,11 @@ func NewIdentity(traitsSchemaID string) *Identity {
 		VerifiableAddresses: []VerifiableAddress{},
 		State:               StateActive,
 		StateChangedAt:      &stateChangedAt,
-		l:                   new(sync.RWMutex),
 	}
 }
 
 func (i Identity) GetID() uuid.UUID {
 	return i.ID
-}
-
-func (i Identity) GetNID() uuid.UUID {
-	return i.NID
 }
 
 func (i Identity) MarshalJSON() ([]byte, error) {
@@ -387,9 +416,9 @@ func (i WithCredentialsAndAdminMetadataInJSON) MarshalJSON() ([]byte, error) {
 	return json.Marshal(localIdentity(i))
 }
 
-type WithCredentialsMetadataAndAdminMetadataInJSON Identity
+type WithCredentialsNoConfigAndAdminMetadataInJSON Identity
 
-func (i WithCredentialsMetadataAndAdminMetadataInJSON) MarshalJSON() ([]byte, error) {
+func (i WithCredentialsNoConfigAndAdminMetadataInJSON) MarshalJSON() ([]byte, error) {
 	type localIdentity Identity
 	for k, v := range i.Credentials {
 		v.Config = nil
@@ -444,12 +473,10 @@ func CollectRecoveryAddresses(i []*Identity) (res []RecoveryAddress) {
 }
 
 func (i *Identity) WithDeclassifiedCredentials(ctx context.Context, c cipher.Provider, includeCredentials []CredentialsType) (*Identity, error) {
-	credsToPublish := make(map[CredentialsType]Credentials)
+	credsToPublish := make(map[CredentialsType]Credentials, len(i.Credentials))
 
 	for ct, original := range i.Credentials {
-		if _, found := lo.Find(includeCredentials, func(i CredentialsType) bool {
-			return i == ct
-		}); !found {
+		if !slices.Contains(includeCredentials, ct) {
 			toPublish := original
 			toPublish.Config = []byte{}
 			credsToPublish[ct] = toPublish
@@ -457,25 +484,27 @@ func (i *Identity) WithDeclassifiedCredentials(ctx context.Context, c cipher.Pro
 		}
 
 		switch ct {
-		case CredentialsTypeOIDC:
+		case CredentialsTypeOIDC, CredentialsTypeSAML:
 			toPublish := original
 			toPublish.Config = []byte{}
 
 			var i int
 			var err error
 			gjson.GetBytes(original.Config, "providers").ForEach(func(_, v gjson.Result) bool {
-				for _, token := range []string{"initial_id_token", "initial_access_token", "initial_refresh_token"} {
-					key := fmt.Sprintf("%d.%s", i, token)
-					ciphertext := v.Get(token).String()
+				if ct == CredentialsTypeOIDC {
+					// Don't expose these for SAML
+					for _, token := range []string{"initial_id_token", "initial_access_token", "initial_refresh_token"} {
+						key := fmt.Sprintf("%d.%s", i, token)
+						ciphertext := v.Get(token).String()
 
-					var plaintext []byte
-					plaintext, err := c.Cipher(ctx).Decrypt(ctx, ciphertext)
-					if err != nil {
-						plaintext = []byte("")
-					}
-					toPublish.Config, err = sjson.SetBytes(toPublish.Config, "providers."+key, string(plaintext))
-					if err != nil {
-						return false
+						plaintext, decryptErr := c.Cipher(ctx).Decrypt(ctx, ciphertext)
+						if decryptErr != nil {
+							plaintext = []byte{}
+						}
+						toPublish.Config, err = sjson.SetBytes(toPublish.Config, "providers."+key, string(plaintext))
+						if err != nil {
+							return false
+						}
 					}
 				}
 
@@ -489,9 +518,18 @@ func (i *Identity) WithDeclassifiedCredentials(ctx context.Context, c cipher.Pro
 					return false
 				}
 
-				toPublish.Config, err = sjson.SetBytes(toPublish.Config, fmt.Sprintf("providers.%d.organization", i), v.Get("organization").String())
-				if err != nil {
-					return false
+				if org := v.Get("organization").String(); org != "" {
+					toPublish.Config, err = sjson.SetBytes(toPublish.Config, fmt.Sprintf("providers.%d.organization", i), org)
+					if err != nil {
+						return false
+					}
+				}
+
+				if useAutoLink := v.Get("use_auto_link").Bool(); useAutoLink {
+					toPublish.Config, err = sjson.SetBytes(toPublish.Config, fmt.Sprintf("providers.%d.use_auto_link", i), useAutoLink)
+					if err != nil {
+						return false
+					}
 				}
 
 				i++
@@ -511,6 +549,16 @@ func (i *Identity) WithDeclassifiedCredentials(ctx context.Context, c cipher.Pro
 	ii := *i
 	ii.Credentials = credsToPublish
 	return &ii, nil
+}
+
+func (i *Identity) deleteCredentialPassword() error {
+	cred, ok := i.GetCredentials(CredentialsTypePassword)
+	if !ok {
+		return errors.WithStack(herodot.ErrNotFound.WithReasonf("You tried to remove a password credential but this user has no such credential set up."))
+	}
+	cred.Config = []byte("{}")
+	i.SetCredentials(CredentialsTypePassword, *cred)
+	return nil
 }
 
 func (i *Identity) deleteCredentialWebAuthFromIdentity() error {
@@ -550,22 +598,28 @@ func (i *Identity) deleteCredentialWebAuthFromIdentity() error {
 	return nil
 }
 
-func (i *Identity) deleteCredentialOIDCFromIdentity(identifierToDelete string) error {
+func (i *Identity) deleteCredentialOIDCSAMLFromIdentity(ct CredentialsType, identifierToDelete string) error {
+	switch ct {
+	case CredentialsTypeOIDC, CredentialsTypeSAML:
+		// ok
+	default:
+		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unexpected credential type encountered: got %q, expected [%s, %s]", ct, CredentialsTypeOIDC, CredentialsTypeSAML))
+	}
 	if identifierToDelete == "" {
 		return errors.WithStack(herodot.ErrBadRequest.WithReasonf("You must provide an identifier to delete this credential."))
 	}
-	_, hasOIDC := i.GetCredentials(CredentialsTypeOIDC)
+	_, hasOIDC := i.GetCredentials(ct)
 	if !hasOIDC {
-		return errors.WithStack(herodot.ErrNotFound.WithReasonf("You tried to remove an OIDC credential but this user has no such credential set up."))
+		return errors.WithStack(herodot.ErrNotFound.WithReasonf("You tried to remove a %s credential but this user has no such credential set up.", ct))
 	}
 	var oidcConfig CredentialsOIDC
-	creds, err := i.ParseCredentials(CredentialsTypeOIDC, &oidcConfig)
+	creds, err := i.ParseCredentials(ct, &oidcConfig)
 	if err != nil {
 		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to decode identity credentials.").WithDebug(err.Error()))
 	}
 
-	var updatedIdentifiers []string
-	var updatedProviders []CredentialsOIDCProvider
+	updatedIdentifiers := make([]string, 0, len(oidcConfig.Providers))
+	updatedProviders := make([]CredentialsOIDCProvider, 0, len(oidcConfig.Providers))
 	var found bool
 	for _, cfg := range oidcConfig.Providers {
 		if identifierToDelete == OIDCUniqueID(cfg.Provider, cfg.Subject) {
@@ -583,7 +637,7 @@ func (i *Identity) deleteCredentialOIDCFromIdentity(identifierToDelete string) e
 	if err != nil {
 		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to encode identity credentials.").WithDebug(err.Error()))
 	}
-	i.Credentials[CredentialsTypeOIDC] = *creds
+	i.Credentials[ct] = *creds
 	return nil
 }
 

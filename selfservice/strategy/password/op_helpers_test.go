@@ -9,23 +9,20 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
-	"golang.org/x/oauth2"
-
 	"github.com/gofrs/uuid"
-	"github.com/pkg/errors"
+	"github.com/phayes/freeport"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	hydraclientgo "github.com/ory/hydra-client-go/v2"
-	"github.com/ory/x/logrusx"
-	"github.com/ory/x/resilience"
 	"github.com/ory/x/urlx"
-
-	"github.com/phayes/freeport"
 )
 
 type clientAppConfig struct {
@@ -134,7 +131,7 @@ func newHydra(t *testing.T, loginUI string, consentUI string) (hydraAdmin string
 	hydraResource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "oryd/hydra",
 		// Keep tag in sync with the version in ci.yaml
-		Tag: "v2.2.0@sha256:6c0f9195fe04ae16b095417b323881f8c9008837361160502e11587663b37c09",
+		Tag: "v2.2.0-rc.3",
 		Env: []string{
 			"DSN=memory",
 			fmt.Sprintf("URLS_SELF_ISSUER=http://127.0.0.1:%d/", publicPort),
@@ -146,8 +143,8 @@ func newHydra(t *testing.T, loginUI string, consentUI string) (hydraAdmin string
 		Cmd:          []string{"serve", "all", "--dev"},
 		ExposedPorts: []string{"4444/tcp", "4445/tcp"},
 		PortBindings: map[docker.Port][]docker.PortBinding{
-			"4444/tcp": {{HostPort: fmt.Sprintf("%d/tcp", publicPort)}},
-			"4445/tcp": {{HostPort: fmt.Sprintf("%d/tcp", adminPort)}},
+			"4444/tcp": {{HostPort: strconv.Itoa(publicPort)}},
+			"4445/tcp": {{HostPort: strconv.Itoa(adminPort)}},
 		},
 	})
 	require.NoError(t, err)
@@ -163,31 +160,25 @@ func newHydra(t *testing.T, loginUI string, consentUI string) (hydraAdmin string
 	hydraPublic = "http://127.0.0.1:" + hydraResource.GetPort("4444/tcp")
 	hydraAdmin = "http://127.0.0.1:" + hydraResource.GetPort("4445/tcp")
 
-	go pool.Client.Logs(docker.LogsOptions{
-		ErrorStream:  TestLogWriter{T: t, streamName: "hydra-stderr"},
-		OutputStream: TestLogWriter{T: t, streamName: "hydra-stdout"},
-		Stdout:       false,
-		Stderr:       true,
-		Follow:       true,
-		Container:    hydraResource.Container.ID,
-	})
-	hl := logrusx.New("hydra-ready-check", "hydra-ready-check")
-	err = resilience.Retry(hl, time.Second*1, time.Second*5, func() error {
-		pr := hydraPublic + "/health/ready"
-		res, err := http.DefaultClient.Get(pr)
-		if err != nil || res.StatusCode != 200 {
-			return errors.Errorf("Hydra public is not ready at " + pr)
-		}
+	go func() {
+		_ = pool.Client.Logs(docker.LogsOptions{
+			ErrorStream:  TestLogWriter{T: t, streamName: "hydra-stderr"},
+			OutputStream: TestLogWriter{T: t, streamName: "hydra-stdout"},
+			Stdout:       false,
+			Stderr:       true,
+			Follow:       true,
+			Container:    hydraResource.Container.ID,
+		})
+	}()
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		res, err := http.DefaultClient.Get(hydraPublic + "/health/ready")
+		require.NoError(t, err)
+		assert.Equal(t, 200, res.StatusCode)
 
-		ar := hydraAdmin + "/health/ready"
-		res, err = http.DefaultClient.Get(ar)
-		if err != nil && res.StatusCode != 200 {
-			return errors.Errorf("Hydra admin is not ready at " + ar)
-		} else {
-			return nil
-		}
-	})
-	require.NoError(t, err)
+		res, err = http.DefaultClient.Get(hydraAdmin + "/health/ready")
+		require.NoError(t, err)
+		assert.Equal(t, 200, res.StatusCode)
+	}, 5*time.Second, time.Second)
 
 	t.Logf("Ory Hydra running at: %s %s", hydraPublic, hydraAdmin)
 

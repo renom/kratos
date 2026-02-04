@@ -20,25 +20,25 @@ import (
 	"github.com/ory/kratos/x"
 )
 
-type Provider interface {
-	Config() *Configuration
-}
-
-type OAuth2Provider interface {
-	Provider
-	AuthCodeURLOptions(r ider) []oauth2.AuthCodeOption
-	AccessTokenURLOptions(r *http.Request) []oauth2.AuthCodeOption
-	OAuth2(ctx context.Context) (*oauth2.Config, error)
-	Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error)
-}
-
-type OAuth1Provider interface {
-	Provider
-	OAuth1(ctx context.Context) *oauth1.Config
-	AuthURL(ctx context.Context, state string) (string, error)
-	Claims(ctx context.Context, token *oauth1.Token) (*Claims, error)
-	ExchangeToken(ctx context.Context, req *http.Request) (*oauth1.Token, error)
-}
+type (
+	Provider interface {
+		Config() *Configuration
+	}
+	OAuth2Provider interface {
+		Provider
+		AuthCodeURLOptions(r ider) []oauth2.AuthCodeOption
+		AccessTokenURLOptions(r *http.Request) []oauth2.AuthCodeOption
+		OAuth2(ctx context.Context) (*oauth2.Config, error)
+		Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error)
+	}
+	OAuth1Provider interface {
+		Provider
+		OAuth1(ctx context.Context) *oauth1.Config
+		AuthURL(ctx context.Context, state string) (string, error)
+		Claims(ctx context.Context, token *oauth1.Token) (*Claims, error)
+		ExchangeToken(ctx context.Context, req *http.Request) (*oauth1.Token, error)
+	}
+)
 
 type OAuth2TokenExchanger interface {
 	Exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error)
@@ -52,21 +52,22 @@ type NonceValidationSkipper interface {
 	CanSkipNonce(*Claims) bool
 }
 
-// ConvertibleBoolean is used as Apple casually sends the email_verified field as a string.
 type Claims struct {
-	Issuer              string                 `json:"iss,omitempty"`
-	Subject             string                 `json:"sub,omitempty"`
-	Name                string                 `json:"name,omitempty"`
-	GivenName           string                 `json:"given_name,omitempty"`
-	FamilyName          string                 `json:"family_name,omitempty"`
-	LastName            string                 `json:"last_name,omitempty"`
-	MiddleName          string                 `json:"middle_name,omitempty"`
-	Nickname            string                 `json:"nickname,omitempty"`
-	PreferredUsername   string                 `json:"preferred_username,omitempty"`
-	Profile             string                 `json:"profile,omitempty"`
-	Picture             string                 `json:"picture,omitempty"`
-	Website             string                 `json:"website,omitempty"`
-	Email               string                 `json:"email,omitempty"`
+	Issuer            string `json:"iss,omitempty"`
+	Subject           string `json:"sub,omitempty"`
+	Object            string `json:"oid,omitempty"`
+	Name              string `json:"name,omitempty"`
+	GivenName         string `json:"given_name,omitempty"`
+	FamilyName        string `json:"family_name,omitempty"`
+	LastName          string `json:"last_name,omitempty"`
+	MiddleName        string `json:"middle_name,omitempty"`
+	Nickname          string `json:"nickname,omitempty"`
+	PreferredUsername string `json:"preferred_username,omitempty"`
+	Profile           string `json:"profile,omitempty"`
+	Picture           string `json:"picture,omitempty"`
+	Website           string `json:"website,omitempty"`
+	Email             string `json:"email,omitempty"`
+	// ConvertibleBoolean is used as Apple casually sends the email_verified field as a string.
 	EmailVerified       x.ConvertibleBoolean   `json:"email_verified,omitempty"`
 	Gender              string                 `json:"gender,omitempty"`
 	Birthdate           string                 `json:"birthdate,omitempty"`
@@ -108,10 +109,10 @@ func (l *Locale) UnmarshalJSON(data []byte) error {
 // Validate checks if the claims are valid.
 func (c *Claims) Validate() error {
 	if c.Subject == "" {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("provider did not return a subject"))
+		return errors.WithStack(herodot.ErrUpstreamError.WithReasonf("provider did not return a subject"))
 	}
 	if c.Issuer == "" {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("issuer not set in claims"))
+		return errors.WithStack(herodot.ErrUpstreamError.WithReasonf("issuer not set in claims"))
 	}
 	return nil
 }

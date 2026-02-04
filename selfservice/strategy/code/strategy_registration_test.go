@@ -14,10 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/ory/kratos/selfservice/flow"
-
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,8 +27,14 @@ import (
 	"github.com/ory/kratos/internal"
 	oryClient "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/selfservice/strategy/code"
+	"github.com/ory/kratos/ui/node"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/snapshotx"
+	"github.com/ory/x/sqlcon"
 )
 
 type state struct {
@@ -116,7 +120,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 		return conf, reg, public
 	}
 
-	createRegistrationFlow := func(ctx context.Context, t *testing.T, public *httptest.Server, apiType ApiType) *state {
+	createRegistrationFlowInternal := func(ctx context.Context, t *testing.T, public *httptest.Server, apiType ApiType, identitySchema string) *state {
 		t.Helper()
 
 		var client *http.Client
@@ -131,9 +135,9 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 
 		var clientInit *oryClient.RegistrationFlow
 		if apiType == ApiTypeNative {
-			clientInit = testhelpers.InitializeRegistrationFlowViaAPI(t, client, public)
+			clientInit = testhelpers.InitializeRegistrationFlowViaAPI(t, client, public, testhelpers.InitFlowWithIdentitySchema(identitySchema))
 		} else {
-			clientInit = testhelpers.InitializeRegistrationFlowViaBrowser(t, client, public, apiType == ApiTypeSPA, false, false)
+			clientInit = testhelpers.InitializeRegistrationFlowViaBrowser(t, client, public, apiType == ApiTypeSPA, false, false, testhelpers.InitFlowWithIdentitySchema(identitySchema))
 		}
 
 		body, err := json.Marshal(clientInit)
@@ -154,6 +158,14 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 			flowID:     clientInit.GetId(),
 			testServer: public,
 		}
+	}
+
+	createRegistrationFlow := func(ctx context.Context, t *testing.T, public *httptest.Server, apiType ApiType) *state {
+		return createRegistrationFlowInternal(ctx, t, public, apiType, "")
+	}
+
+	createRegistrationFlowWithIdentity := func(ctx context.Context, t *testing.T, public *httptest.Server, apiType ApiType, identitySchema string) *state {
+		return createRegistrationFlowInternal(ctx, t, public, apiType, identitySchema)
 	}
 
 	type onSubmitAssertion func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response)
@@ -285,12 +297,13 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 						v.Set("code", registrationCode)
 					}, tc.apiType, nil)
 
-					if tc.apiType == ApiTypeSPA {
+					switch tc.apiType {
+					case ApiTypeSPA:
 						assert.EqualValues(t, flow.ContinueWithActionRedirectBrowserToString, gjson.Get(state.body, "continue_with.0.action").String(), "%s", state.body)
 						assert.Contains(t, gjson.Get(state.body, "continue_with.0.redirect_browser_to").String(), conf.SelfServiceBrowserDefaultReturnTo(ctx).String(), "%s", state.body)
-					} else if tc.apiType == ApiTypeSPA {
+					case ApiTypeBrowser:
 						assert.Empty(t, gjson.Get(state.body, "continue_with").Array(), "%s", state.body)
-					} else if tc.apiType == ApiTypeNative {
+					case ApiTypeNative:
 						assert.NotContains(t, gjson.Get(state.body, "continue_with").Raw, string(flow.ContinueWithActionRedirectBrowserToString), "%s", state.body)
 					}
 				})
@@ -396,7 +409,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 						require.Contains(t, gjson.Get(body, "ui.messages").String(), "The registration code is invalid or has already been used. Please try again")
 					})
 
-					s = submitOTP(ctx, t, reg, s, func(v *url.Values) {
+					submitOTP(ctx, t, reg, s, func(v *url.Values) {
 						v.Set("code", registrationCode2)
 					}, tc.apiType, nil)
 				})
@@ -418,7 +431,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 
 					s.email = "not-" + s.email // swap out email
 					// 3. Submit OTP
-					s = submitOTP(ctx, t, reg, s, func(v *url.Values) {
+					submitOTP(ctx, t, reg, s, func(v *url.Values) {
 						v.Set("code", registrationCode)
 					}, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
 						if tc.apiType == ApiTypeBrowser {
@@ -446,7 +459,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 					assert.NotEmpty(t, registrationCode)
 
 					// 3. Submit OTP
-					s = submitOTP(ctx, t, reg, s, func(v *url.Values) {
+					submitOTP(ctx, t, reg, s, func(v *url.Values) {
 						v.Set("code", registrationCode)
 						v.Set("traits.tos", "0")
 					}, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
@@ -468,12 +481,13 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 					// 2. Submit Identifier (email)
 					s = registerNewUser(ctx, t, s, tc.apiType, nil)
 
-					reg.Persister().Transaction(ctx, func(ctx context.Context, connection *pop.Connection) error {
+					err := reg.Persister().Transaction(ctx, func(ctx context.Context, connection *pop.Connection) error {
 						count, err := connection.RawQuery(fmt.Sprintf("SELECT * FROM %s WHERE selfservice_registration_flow_id = ?", new(code.RegistrationCode).TableName(ctx)), uuid.FromStringOrNil(s.flowID)).Count(new(code.RegistrationCode))
 						require.NoError(t, err)
 						require.Equal(t, 1, count)
 						return nil
 					})
+					require.NoError(t, err)
 
 					for i := 0; i < 5; i++ {
 						s = submitOTP(ctx, t, reg, s, func(v *url.Values) {
@@ -538,7 +552,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 					s := createRegistrationFlow(ctx, t, public, tc.apiType)
 
 					// 2. Submit Identifier (email)
-					s = registerNewUser(ctx, t, s, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
+					registerNewUser(ctx, t, s, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
 						if tc.apiType == ApiTypeBrowser {
 							// we expect a redirect to the registration page with the flow id
 							require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -580,7 +594,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 					assert.NotEmpty(t, registrationCode)
 
 					// 3. Submit OTP
-					state = submitOTP(ctx, t, reg, state, func(v *url.Values) {
+					submitOTP(ctx, t, reg, state, func(v *url.Values) {
 						v.Set("code", registrationCode)
 					}, tc.apiType, nil)
 				})
@@ -603,7 +617,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 					registrationCode := testhelpers.CourierExpectCodeInMessage(t, message, 1)
 					assert.NotEmpty(t, registrationCode)
 
-					s = submitOTP(ctx, t, reg, s, func(v *url.Values) {
+					submitOTP(ctx, t, reg, s, func(v *url.Values) {
 						v.Set("code", registrationCode)
 					}, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
 						if tc.apiType == ApiTypeBrowser {
@@ -619,5 +633,179 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 				})
 			})
 		}
+	})
+
+	t.Run("test=multi-schema select", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		conf, reg, public := setup(ctx, t)
+		conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+			{ID: "code", URL: "file://./stub/code.identity.schema.json", SelfserviceSelectable: true},
+			{ID: "no-code", URL: "file://stub/no-code.schema.json", SelfserviceSelectable: true},
+		})
+		conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "no-code")
+
+		for _, tc := range []struct {
+			d       string
+			apiType ApiType
+		}{
+			{
+				d:       "SPA client",
+				apiType: ApiTypeSPA,
+			},
+			{
+				d:       "Browser client",
+				apiType: ApiTypeBrowser,
+			},
+			{
+				d:       "Native client",
+				apiType: ApiTypeNative,
+			},
+		} {
+			t.Run("flow="+tc.d, func(t *testing.T) {
+				t.Run("case=should be able to register with code identity credentials", func(t *testing.T) {
+					ctx := context.Background()
+
+					// 1. Initiate flow
+					state := createRegistrationFlowWithIdentity(ctx, t, public, tc.apiType, "code")
+					state.email = testhelpers.RandomEmail()
+
+					// 2. Submit Identifier (email)
+					state = registerNewUser(ctx, t, state, tc.apiType, nil)
+
+					message := testhelpers.CourierExpectMessage(ctx, t, reg, state.email, "Use code")
+					assert.Contains(t, message.Body, "Complete your account registration with the following code")
+
+					registrationCode := testhelpers.CourierExpectCodeInMessage(t, message, 1)
+					assert.NotEmpty(t, registrationCode)
+
+					// 3. Submit OTP
+					state = submitOTP(ctx, t, reg, state, func(v *url.Values) {
+						v.Set("code", registrationCode)
+					}, tc.apiType, nil)
+
+					switch tc.apiType {
+					case ApiTypeSPA:
+						assert.EqualValues(t, flow.ContinueWithActionRedirectBrowserToString, gjson.Get(state.body, "continue_with.0.action").String(), "%s", state.body)
+						assert.Contains(t, gjson.Get(state.body, "continue_with.0.redirect_browser_to").String(), conf.SelfServiceBrowserDefaultReturnTo(ctx).String(), "%s", state.body)
+					case ApiTypeBrowser:
+						assert.Empty(t, gjson.Get(state.body, "continue_with").Array(), "%s", state.body)
+					case ApiTypeNative:
+						assert.NotContains(t, gjson.Get(state.body, "continue_with").Raw, string(flow.ContinueWithActionRedirectBrowserToString), "%s", state.body)
+					}
+
+					identity, _, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, identity.CredentialsTypeCodeAuth, state.email)
+					require.NoError(t, err, sqlcon.ErrNoRows)
+
+					assert.NotEmpty(t, identity.ID, "%s", identity.ID)
+					assert.Equal(t, state.email, gjson.Get(identity.Traits.String(), "email").String(), "%s", identity.Traits.String())
+					assert.Equal(t, "code", identity.SchemaID, "%s", identity.SchemaID)
+				})
+
+				t.Run("case=registration should fail with invalid form data", func(t *testing.T) {
+					ctx := context.Background()
+
+					// 1. Initiate flow
+					s := createRegistrationFlowWithIdentity(ctx, t, public, tc.apiType, "code")
+					s.email = "invalidemail"
+
+					// 2. Submit Identifier (email)
+					registerNewUser(ctx, t, s, tc.apiType, func(ctx context.Context, t *testing.T, s *state, body string, resp *http.Response) {
+						if tc.apiType == ApiTypeBrowser {
+							require.EqualValues(t, http.StatusOK, resp.StatusCode)
+						} else {
+							require.EqualValues(t, http.StatusBadRequest, resp.StatusCode)
+						}
+						require.Equal(t, int64(4000001), gjson.Get(body, "ui.nodes.#(attributes.name==traits.email).messages.0.id").Int(), "%s", body)
+						require.Equal(t, "\"invalidemail\" is not valid \"email\"", gjson.Get(body, "ui.nodes.#(attributes.name==traits.email).messages.0.text").String(), "%s", body)
+					})
+				})
+			})
+		}
+	})
+}
+
+func TestPopulateRegistrationMethod(t *testing.T) {
+	ctx := context.Background()
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+	ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://stub/code.identity.schema.json")
+
+	conf.MustSet(ctx, fmt.Sprintf("%s.%s.passwordless_enabled", config.ViperKeySelfServiceStrategyConfig, identity.CredentialsTypeCodeAuth), true)
+
+	s, err := reg.AllRegistrationStrategies().Strategy(identity.CredentialsTypeCodeAuth)
+	require.NoError(t, err)
+
+	fh, ok := s.(registration.FormHydrator)
+	require.True(t, ok)
+
+	toSnapshot := func(t *testing.T, f node.Nodes) {
+		t.Helper()
+		// The CSRF token has a unique value that messes with the snapshot - ignore it.
+		f.ResetNodes("csrf_token")
+		snapshotx.SnapshotT(t, f, snapshotx.ExceptNestedKeys("nonce", "src"))
+	}
+
+	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *registration.Flow) {
+		r := httptest.NewRequest("GET", "/self-service/registration/browser", nil)
+		r = r.WithContext(ctx)
+		t.Helper()
+		f, err := registration.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f.UI.Nodes = make(node.Nodes, 0)
+		require.NoError(t, err)
+		return r, f
+	}
+
+	t.Run("method=PopulateRegistrationMethod", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethod(r, f))
+		toSnapshot(t, f.UI.Nodes)
+	})
+
+	t.Run("method=PopulateRegistrationMethodProfile", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+		toSnapshot(t, f.UI.Nodes)
+	})
+
+	t.Run("method=PopulateRegistrationMethodCredentials", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+		toSnapshot(t, f.UI.Nodes)
+	})
+
+	t.Run("method=idempotency", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+
+		var snapshots []node.Nodes
+
+		t.Run("case=1", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=2", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=3", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=4", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=evaluate", func(t *testing.T) {
+			assertx.EqualAsJSON(t, snapshots[0], snapshots[2])
+			assertx.EqualAsJSON(t, snapshots[1], snapshots[3])
+		})
 	})
 }

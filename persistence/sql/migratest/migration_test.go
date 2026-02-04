@@ -8,30 +8,19 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/servicelocatorx"
-
-	"github.com/ory/kratos/identity"
 
 	"github.com/bradleyjkemp/cupaloy/v2"
-	"github.com/stretchr/testify/assert"
-
-	"github.com/ory/x/dbal"
-
-	"github.com/ory/kratos/x/xsql"
-
-	"github.com/ory/x/migratest"
-
-	"github.com/gobuffalo/pop/v6"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/selfservice/flow/registration"
@@ -41,18 +30,15 @@ import (
 	"github.com/ory/kratos/selfservice/strategy/link"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/logrusx"
+	"github.com/ory/x/migratest"
+	"github.com/ory/x/pagination/keysetpagination"
 	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlcon/dockertest"
 )
-
-func init() {
-	dbal.RegisterDriver(func() dbal.Driver {
-		return driver.NewRegistryDefault()
-	})
-}
 
 func snapshotFor(paths ...string) *cupaloy.Config {
 	return cupaloy.New(
@@ -87,7 +73,7 @@ func TestMigrations_Postgres(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 	t.Parallel()
-	testDatabase(t, "postgres", dockertest.ConnectPop(t, dockertest.RunTestPostgreSQLWithVersion(t, "11.8")))
+	testDatabase(t, "postgres", dockertest.ConnectPop(t, dockertest.RunTestPostgreSQLWithVersion(t, "16")))
 }
 
 func TestMigrations_Mysql(t *testing.T) {
@@ -95,7 +81,7 @@ func TestMigrations_Mysql(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 	t.Parallel()
-	testDatabase(t, "mysql", dockertest.ConnectPop(t, dockertest.RunTestMySQLWithVersion(t, "8.0.34")))
+	testDatabase(t, "mysql", dockertest.ConnectPop(t, dockertest.RunTestMySQLWithVersion(t, "8.4")))
 }
 
 func TestMigrations_Cockroach(t *testing.T) {
@@ -103,59 +89,65 @@ func TestMigrations_Cockroach(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 	t.Parallel()
-	testDatabase(t, "cockroach", dockertest.ConnectPop(t, dockertest.RunTestCockroachDBWithVersion(t, "latest-v23.1")))
+	testDatabase(t, "cockroach", dockertest.ConnectPop(t, dockertest.RunTestCockroachDBWithVersion(t, "latest-v25.3")))
 }
 
 func testDatabase(t *testing.T, db string, c *pop.Connection) {
 	ctx := context.Background()
 	l := logrusx.New("", "", logrusx.ForceLevel(logrus.DebugLevel))
 
-	t.Logf("Cleaning up before migrations")
-	_ = os.Remove("../migrations/sql/schema.sql")
-	xsql.CleanSQL(t, c)
-
-	t.Cleanup(func() {
-		t.Logf("Cleaning up after migrations")
-		xsql.CleanSQL(t, c)
-		require.NoError(t, c.Close())
-	})
-
 	url := c.URL()
-	// workaround for https://github.com/gobuffalo/pop/issues/538
+	// workaround for https://github.com/ory/pop/issues/538
 	switch db {
 	case "mysql":
 		url = "mysql://" + url
 	case "sqlite":
 		url = "sqlite3://" + url
+	case "cockroach":
+		url = "cockroach" + strings.TrimPrefix(url, "postgres")
 	}
+	if db != "sqlite" {
+		dbName := "testdb" + strings.ReplaceAll(x.NewUUID().String(), "-", "")
+		require.NoError(t, c.RawQuery("CREATE DATABASE "+dbName).Exec())
+		url = regexp.MustCompile(`/[a-z0-9]+\?`).ReplaceAllString(url, "/"+dbName+"?")
+	}
+
 	t.Logf("URL: %s", url)
+	var err error
+	c, err = pop.NewConnection(&pop.ConnectionDetails{URL: url})
+	require.NoError(t, err)
+	require.NoError(t, c.Open())
 
 	tm, err := popx.NewMigrationBox(
 		os.DirFS("../migrations/sql"),
-		popx.NewMigrator(c, l, nil, 1*time.Minute),
+		c, l,
 		popx.WithTestdata(t, os.DirFS("./testdata")),
+		popx.WithDumpMigrations(),
 	)
 	require.NoError(t, err)
-	tm.DumpMigrations = true
 	require.NoError(t, tm.Up(ctx))
+	// t.Skip() // uncomment to get the current state of the database after the migrations have run
 
 	t.Run("suite=fixtures", func(t *testing.T) {
+		t.Cleanup(func() {
+			// clean up test duplicates - remove identity_credential_identifiers 10985ed1-5b6e-4012-ac10-03d87df65618 - otherwise down migration later fails.
+			require.NoError(t, c.RawQuery("DELETE FROM identity_credential_identifiers WHERE identifier = '10985ed1-5b6e-4012-ac10-03d87df65618'").Exec())
+		})
+
 		wg := &sync.WaitGroup{}
 
 		d, err := driver.New(
 			context.Background(),
 			os.Stderr,
-			servicelocatorx.NewOptions(),
-			nil,
-			[]configx.OptionModifier{
-				configx.WithValues(map[string]interface{}{
+			driver.WithConfigOptions(
+				configx.WithValues(map[string]any{
 					config.ViperKeyDSN:             url,
 					config.ViperKeyPublicBaseURL:   "https://www.ory.sh/",
 					config.ViperKeyIdentitySchemas: config.Schemas{{ID: "default", URL: "file://stub/default.schema.json"}},
 					config.ViperKeySecretsDefault:  []string{"secret"},
 				}),
 				configx.SkipValidation(),
-			},
+			),
 		)
 		require.NoError(t, err)
 
@@ -422,6 +414,6 @@ func testDatabase(t *testing.T, db string, c *pop.Connection) {
 		})
 	})
 
-	tm.DumpMigrations = false
-	require.NoError(t, tm.Down(ctx, -1))
+	err = tm.Down(ctx, -1) // for easy breakpointing
+	require.NoError(t, err)
 }

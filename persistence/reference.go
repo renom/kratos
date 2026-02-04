@@ -14,7 +14,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/gobuffalo/pop/v6"
+	"github.com/ory/pop/v6"
 
 	"github.com/ory/x/popx"
 
@@ -58,19 +58,19 @@ type Persister interface {
 
 	CleanupDatabase(context.Context, time.Duration, time.Duration, int) error
 	Close(context.Context) error
-	Ping() error
-	MigrationStatus(c context.Context) (popx.MigrationStatuses, error)
-	MigrateDown(c context.Context, steps int) error
-	MigrateUp(c context.Context) error
-	Migrator() *popx.Migrator
+	Ping(context.Context) error
+	MigrationStatus(context.Context) (popx.MigrationStatuses, error)
+	MigrateDown(ctx context.Context, steps int) error
+	MigrateUp(context.Context) error
 	MigrationBox() *popx.MigrationBox
-	GetConnection(ctx context.Context) *pop.Connection
+	GetConnection(context.Context) *pop.Connection
+	Connection(ctx context.Context) *pop.Connection
 	x.TransactionalPersister
 	Networker
 }
 
 type Networker interface {
-	WithNetworkID(sid uuid.UUID) Persister
+	WithNetworkID(nid uuid.UUID) Persister
 	NetworkID(ctx context.Context) uuid.UUID
 	DetermineNetwork(ctx context.Context) (*networkx.Network, error)
 }

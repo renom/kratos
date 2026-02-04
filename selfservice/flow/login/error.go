@@ -6,6 +6,11 @@ package login
 import (
 	"net/http"
 
+	"github.com/gofrs/uuid"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/ory/x/otelx"
+
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/selfservice/sessiontokenexchange"
@@ -41,6 +46,7 @@ type (
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
+		x.TracingProvider
 		config.Provider
 		sessiontokenexchange.PersistenceProvider
 
@@ -60,25 +66,30 @@ func NewFlowErrorHandler(d errorHandlerDependencies) *ErrorHandler {
 }
 
 func (s *ErrorHandler) PrepareReplacementForExpiredFlow(w http.ResponseWriter, r *http.Request, f *Flow, err error) (*flow.ExpiredError, error) {
-	e := new(flow.ExpiredError)
-	if !errors.As(err, &e) {
+	errExpired := new(flow.ExpiredError)
+	if !errors.As(err, &errExpired) {
 		return nil, nil
 	}
 	// create new flow because the old one is not valid
-	a, err := s.d.LoginHandler().FromOldFlow(w, r, *f)
+	newFlow, err := s.d.LoginHandler().FromOldFlow(w, r, *f)
 	if err != nil {
 		return nil, err
 	}
 
-	a.UI.Messages.Add(text.NewErrorValidationLoginFlowExpired(e.ExpiredAt))
-	if err := s.d.LoginFlowPersister().UpdateLoginFlow(r.Context(), a); err != nil {
+	newFlow.UI.Messages.Add(text.NewErrorValidationLoginFlowExpired(errExpired.ExpiredAt))
+	if err := s.d.LoginFlowPersister().UpdateLoginFlow(r.Context(), newFlow); err != nil {
 		return nil, err
 	}
 
-	return e.WithFlow(a), nil
+	return errExpired.WithFlow(newFlow), nil
 }
 
 func (s *ErrorHandler) WriteFlowError(w http.ResponseWriter, r *http.Request, f *Flow, group node.UiNodeGroup, err error) {
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.flow.login.ErrorHandler.WriteFlowError",
+		trace.WithAttributes(attribute.String("error", err.Error())))
+	r = r.WithContext(ctx)
+	defer otelx.End(span, &err)
+
 	logger := s.d.Audit().
 		WithError(err).
 		WithRequest(r).
@@ -88,12 +99,13 @@ func (s *ErrorHandler) WriteFlowError(w http.ResponseWriter, r *http.Request, f 
 		Info("Encountered self-service login error.")
 
 	if f == nil {
-		trace.SpanFromContext(r.Context()).AddEvent(events.NewLoginFailed(r.Context(), "", "", false))
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewLoginFailed(r.Context(), uuid.Nil, "", "", false, err))
 		s.forward(w, r, nil, err)
 		return
 	}
 
-	trace.SpanFromContext(r.Context()).AddEvent(events.NewLoginFailed(r.Context(), string(f.Type), string(f.RequestedAAL), f.Refresh))
+	span.SetAttributes(attribute.String("flow_id", f.ID.String()))
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewLoginFailed(r.Context(), f.ID, string(f.Type), string(f.RequestedAAL), f.Refresh, err))
 
 	if expired, inner := s.PrepareReplacementForExpiredFlow(w, r, f, err); inner != nil {
 		s.WriteFlowError(w, r, f, group, inner)

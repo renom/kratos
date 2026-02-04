@@ -8,31 +8,24 @@ import (
 	"testing"
 	"time"
 
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
-
-	"github.com/ory/x/dbal"
-
-	"github.com/gobuffalo/pop/v6"
-
-	"github.com/ory/x/pagination/keysetpagination"
-
-	"github.com/ory/x/pointerx"
-
-	"github.com/ory/kratos/identity"
-
 	"github.com/go-faker/faker/v4"
 	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/persistence"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/dbal"
+	"github.com/ory/x/pagination/keysetpagination"
+	"github.com/ory/x/pointerx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/sqlcon"
 )
@@ -295,11 +288,10 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			} {
 				t.Run("case=all "+tc.desc, func(t *testing.T) {
 					paginatorOpts := make([]keysetpagination.Option, 0)
-					actual, total, nextPage, err := l.ListSessions(ctx, tc.active, paginatorOpts, session.ExpandEverything)
+					actual, nextPage, err := l.ListSessions(ctx, tc.active, paginatorOpts, session.ExpandEverything)
 					require.NoError(t, err, "%+v", err)
 
 					require.Equal(t, len(tc.expected), len(actual))
-					require.Equal(t, int64(len(tc.expected)), total)
 					assert.Equal(t, true, nextPage.IsLast())
 
 					mapPageToken := nextPage.Token().Parse("")
@@ -322,11 +314,10 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 
 			t.Run("case=all sessions pagination only one page", func(t *testing.T) {
 				paginatorOpts := make([]keysetpagination.Option, 0)
-				actual, total, page, err := l.ListSessions(ctx, nil, paginatorOpts, session.ExpandEverything)
+				actual, page, err := l.ListSessions(ctx, nil, paginatorOpts, session.ExpandEverything)
 				require.NoError(t, err)
 
 				require.Equal(t, 6, len(actual))
-				require.Equal(t, int64(6), total)
 				assert.Equal(t, true, page.IsLast())
 				mapPageToken := page.Token().Parse("")
 				assert.Equal(t, uuid.Nil.String(), mapPageToken["id"])
@@ -336,9 +327,8 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			t.Run("case=all sessions pagination multiple pages", func(t *testing.T) {
 				paginatorOpts := make([]keysetpagination.Option, 0)
 				paginatorOpts = append(paginatorOpts, keysetpagination.WithSize(3))
-				firstPageItems, total, page1, err := l.ListSessions(ctx, nil, paginatorOpts, session.ExpandEverything)
+				firstPageItems, page1, err := l.ListSessions(ctx, nil, paginatorOpts, session.ExpandEverything)
 				require.NoError(t, err)
-				require.Equal(t, int64(6), total)
 				assert.Len(t, firstPageItems, 3)
 
 				assert.Equal(t, false, page1.IsLast())
@@ -347,9 +337,8 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				assert.Equal(t, 3, page1.Size())
 
 				// Validate secondPageItems page
-				secondPageItems, total, page2, err := l.ListSessions(ctx, nil, page1.ToOptions(), session.ExpandEverything)
+				secondPageItems, page2, err := l.ListSessions(ctx, nil, page1.ToOptions(), session.ExpandEverything)
 				require.NoError(t, err)
-				require.Equal(t, int64(6), total)
 				assert.Len(t, secondPageItems, 3)
 
 				acutalIDs := make([]uuid.UUID, 0)
@@ -611,7 +600,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 		})
 
 		t.Run("extend session lifespan but min time is not yet reached", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
+			ctx := contextx.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))
@@ -626,7 +615,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 		})
 
 		t.Run("extend session lifespan", func(t *testing.T) {
-			ctx := confighelpers.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
+			ctx := contextx.WithConfigValues(ctx, map[string]any{config.ViperKeySessionRefreshMinTimeLeft: 2 * time.Hour})
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))
@@ -646,7 +635,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				t.Skip("Skipping test because driver is not CockroachDB")
 			}
 
-			ctx := confighelpers.WithConfigValue(ctx, config.ViperKeySessionRefreshMinTimeLeft, 2*time.Hour)
+			ctx := contextx.WithConfigValue(ctx, config.ViperKeySessionRefreshMinTimeLeft, 2*time.Hour)
 
 			var expected session.Session
 			require.NoError(t, faker.FakeData(&expected))

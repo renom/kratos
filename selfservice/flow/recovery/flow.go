@@ -4,13 +4,16 @@
 package recovery
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"time"
 
-	"github.com/gobuffalo/pop/v6"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/x/redir"
+
+	"github.com/ory/pop/v6"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -19,6 +22,7 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -110,7 +114,7 @@ type Flow struct {
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" faker:"-" db:"-"`
 }
 
-var _ flow.Flow = new(Flow)
+var _ flow.Flow = (*Flow)(nil)
 
 func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, ft flow.Type) (*Flow, error) {
 	now := time.Now().UTC()
@@ -118,17 +122,24 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
 	requestURL := x.RequestURL(r).String()
-	_, err := x.SecureRedirectTo(r,
+	_, err := redir.SecureRedirectTo(r,
 		conf.SelfServiceBrowserDefaultReturnTo(r.Context()),
-		x.SecureRedirectUseSourceURL(requestURL),
-		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
-		x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
+		redir.SecureRedirectUseSourceURL(requestURL),
+		redir.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains(r.Context())),
+		redir.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL(r.Context())),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	flow := &Flow{
+	state := flow.StateChooseMethod
+	if conf.ChooseRecoveryAddress(r.Context()) {
+		state = flow.StateRecoveryAwaitingAddress
+	} else {
+		trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "legacy_recovery_flow"))
+	}
+
+	f := &Flow{
 		ID:         id,
 		ExpiresAt:  now.Add(exp),
 		IssuedAt:   now,
@@ -137,19 +148,19 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 			Method: "POST",
 			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(r.Context()), RouteSubmitFlow), id).String(),
 		},
-		State:     flow.StateChooseMethod,
+		State:     state,
 		CSRFToken: csrf,
 		Type:      ft,
 	}
 
 	if strategy != nil {
-		flow.Active = sqlxx.NullString(strategy.NodeGroup())
-		if err := strategy.PopulateRecoveryMethod(r, flow); err != nil {
+		f.Active = sqlxx.NullString(strategy.NodeGroup())
+		if err := strategy.PopulateRecoveryMethod(r, f); err != nil {
 			return nil, err
 		}
 	}
 
-	return flow, nil
+	return f, nil
 }
 
 func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, of Flow) (*Flow, error) {
@@ -167,25 +178,15 @@ func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Re
 	return nf, nil
 }
 
-func (f *Flow) GetType() flow.Type {
-	return f.Type
-}
-
-func (f *Flow) GetRequestURL() string {
-	return f.RequestURL
-}
-
-func (f Flow) TableName(ctx context.Context) string {
-	return "selfservice_recovery_flows"
-}
-
-func (f Flow) GetID() uuid.UUID {
-	return f.ID
-}
-
-func (f Flow) GetNID() uuid.UUID {
-	return f.NID
-}
+func (f *Flow) GetType() flow.Type                   { return f.Type }
+func (f *Flow) GetRequestURL() string                { return f.RequestURL }
+func (Flow) TableName() string                       { return "selfservice_recovery_flows" }
+func (f Flow) GetID() uuid.UUID                      { return f.ID }
+func (f *Flow) GetUI() *container.Container          { return f.UI }
+func (f *Flow) GetState() State                      { return f.State }
+func (Flow) GetFlowName() flow.FlowName              { return flow.RecoveryFlow }
+func (f *Flow) SetState(state State)                 { f.State = state }
+func (f *Flow) GetTransientPayload() json.RawMessage { return f.TransientPayload }
 
 func (f *Flow) Valid() error {
 	if f.ExpiresAt.Before(time.Now().UTC()) {
@@ -229,31 +230,11 @@ func (f *Flow) AfterSave(*pop.Connection) error {
 	return nil
 }
 
-func (f *Flow) GetUI() *container.Container {
-	return f.UI
-}
-
-func (f *Flow) GetState() State {
-	return f.State
-}
-
-func (f *Flow) GetFlowName() flow.FlowName {
-	return flow.RecoveryFlow
-}
-
-func (f *Flow) SetState(state State) {
-	f.State = state
-}
-
-func (t *Flow) GetTransientPayload() json.RawMessage {
-	return t.TransientPayload
-}
-
-func (f *Flow) ToLoggerField() map[string]interface{} {
+func (f *Flow) ToLoggerField() map[string]any {
 	if f == nil {
-		return map[string]interface{}{}
+		return map[string]any{}
 	}
-	return map[string]interface{}{
+	return map[string]any{
 		"id":          f.ID.String(),
 		"return_to":   f.ReturnTo,
 		"request_url": f.RequestURL,

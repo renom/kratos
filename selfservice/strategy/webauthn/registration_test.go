@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
@@ -30,12 +31,12 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/snapshotx"
 )
 
 var (
 	flows = []string{"spa", "browser"}
-	//go:embed fixtures/registration/success/identity.json
-	registrationFixtureSuccessIdentity []byte
 	//go:embed fixtures/registration/success/response.json
 	registrationFixtureSuccessResponse []byte
 	//go:embed fixtures/registration/success/internal_context.json
@@ -55,6 +56,7 @@ func newRegistrationRegistry(t *testing.T) *driver.RegistryDefault {
 	conf.MustSet(ctx, config.ViperKeyWebAuthnPasswordless, true)
 	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationLoginHints, true)
 	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnableLegacyOneStep, true)
+	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnableLegacyOneStep, true)
 
 	return reg
 }
@@ -63,8 +65,8 @@ func TestRegistration(t *testing.T) {
 	reg := newRegistrationRegistry(t)
 	conf := reg.Config()
 
-	router := x.NewRouterPublic()
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
+	router := x.NewRouterPublic(reg)
+	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin(reg))
 
 	_ = testhelpers.NewErrorTestServer(t, reg)
 	_ = testhelpers.NewRegistrationUIFlowEchoServer(t, reg)
@@ -78,7 +80,7 @@ func TestRegistration(t *testing.T) {
 
 	// set the "return to" server, which will assert the session state
 	// (redirTS: enforce that a session exists, redirNoSessionTS: enforce that no session exists)
-	var useReturnToFromTS = func(ts *httptest.Server) {
+	useReturnToFromTS := func(ts *httptest.Server) {
 		conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, ts.URL+"/default-return-to")
 		conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+"."+config.DefaultBrowserReturnURL, ts.URL+"/registration-return-ts")
 	}
@@ -113,9 +115,9 @@ func TestRegistration(t *testing.T) {
 		})
 	})
 
-	t.Run("AssertSchemDoesNotExist", func(t *testing.T) {
+	t.Run("AssertSchemaDoesNotExist", func(t *testing.T) {
 		reg := newRegistrationRegistry(t)
-		registrationhelpers.AssertSchemDoesNotExist(t, reg, flows, func(v url.Values) {
+		registrationhelpers.AssertSchemaDoesNotExist(t, reg, flows, func(v url.Values) {
 			v.Set(node.WebAuthnRegister, "{}")
 			v.Del("method")
 		})
@@ -143,7 +145,7 @@ func TestRegistration(t *testing.T) {
 				client := testhelpers.NewClientWithCookies(t)
 				f := testhelpers.InitializeRegistrationFlowViaBrowser(t, client, publicTS, flowToIsSPA(f), false, false)
 				testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
-					"2.attributes.value",
+					"0.attributes.value",
 					"5.attributes.onclick",
 					"5.attributes.value",
 					"6.attributes.nonce",
@@ -156,7 +158,7 @@ func TestRegistration(t *testing.T) {
 	t.Run("case=should return an error because not passing validation", func(t *testing.T) {
 		email := testhelpers.RandomEmail()
 
-		var values = func(v url.Values) {
+		values := func(v url.Values) {
 			v.Set("traits.username", email)
 			v.Del("traits.foobar")
 			v.Set(node.WebAuthnRegister, "{}")
@@ -179,7 +181,7 @@ func TestRegistration(t *testing.T) {
 	t.Run("case=should reject invalid transient payload", func(t *testing.T) {
 		email := testhelpers.RandomEmail()
 
-		var values = func(v url.Values) {
+		values := func(v url.Values) {
 			v.Set("traits.username", email)
 			v.Set("traits.foobar", "bar")
 			v.Set("transient_payload", "42")
@@ -203,7 +205,7 @@ func TestRegistration(t *testing.T) {
 
 	t.Run("case=should return an error because webauthn response is invalid", func(t *testing.T) {
 		email := testhelpers.RandomEmail()
-		var values = func(v url.Values) {
+		values := func(v url.Values) {
 			v.Set("traits.username", email)
 			v.Set("traits.foobar", "bazbar")
 			v.Set(node.WebAuthnRegister, "{}")
@@ -256,7 +258,7 @@ func TestRegistration(t *testing.T) {
 		}} {
 			tc := tc
 			t.Run("context="+tc.name, func(t *testing.T) {
-				var values = func(v url.Values) {
+				values := func(v url.Values) {
 					v.Set("traits.username", email)
 					v.Set("traits.foobar", "bazbar")
 					v.Set(node.WebAuthnRegister, string(registrationFixtureSuccessResponse))
@@ -290,7 +292,7 @@ func TestRegistration(t *testing.T) {
 
 		email := testhelpers.RandomEmail()
 
-		var values = func(v url.Values) {
+		values := func(v url.Values) {
 			v.Set("traits.email", email)
 			v.Set(node.WebAuthnRegister, string(registrationFixtureSuccessResponse))
 			v.Del("method")
@@ -307,16 +309,16 @@ func TestRegistration(t *testing.T) {
 		}
 	})
 
-	makeRegistration := func(t *testing.T, f string, values func(v url.Values)) (actual string, res *http.Response, fetchedFlow *registration.Flow) {
-		actual, res, actualFlow := submitWebAuthnRegistrationWithClient(t, f, registrationFixtureSuccessInternalContext, testhelpers.NewClientWithCookies(t), values)
+	makeRegistration := func(t *testing.T, f string, values func(v url.Values), opts ...testhelpers.InitFlowWithOption) (actual string, res *http.Response, fetchedFlow *registration.Flow) {
+		actual, res, actualFlow := submitWebAuthnRegistrationWithClient(t, f, registrationFixtureSuccessInternalContext, testhelpers.NewClientWithCookies(t), values, opts...)
 		fetchedFlow, err := reg.RegistrationFlowPersister().GetRegistrationFlow(context.Background(), uuid.FromStringOrNil(actualFlow.Id))
 		require.NoError(t, err)
 
 		return actual, res, fetchedFlow
 	}
 
-	makeSuccessfulRegistration := func(t *testing.T, f string, expectReturnTo string, values func(v url.Values)) (actual string) {
-		actual, res, fetchedFlow := makeRegistration(t, f, values)
+	makeSuccessfulRegistration := func(t *testing.T, f string, expectReturnTo string, values func(v url.Values), opts ...testhelpers.InitFlowWithOption) (actual string) {
+		actual, res, fetchedFlow := makeRegistration(t, f, values, opts...)
 		assert.Empty(t, gjson.GetBytes(fetchedFlow.InternalContext, flow.PrefixInternalContextKey(identity.CredentialsTypeWebAuthn, webauthn.InternalContextKeySessionData)), "has cleaned up the internal context after success")
 		if f == "spa" {
 			expectReturnTo = publicTS.URL
@@ -337,7 +339,7 @@ func TestRegistration(t *testing.T) {
 			conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypeWebAuthn.String()), nil)
 		})
 
-		var values = func(email string) func(v url.Values) {
+		values := func(email string) func(v url.Values) {
 			return func(v url.Values) {
 				v.Set("traits.username", email)
 				v.Set("traits.foobar", "bazbar")
@@ -480,6 +482,50 @@ func TestRegistration(t *testing.T) {
 				})
 			}
 		})
+
+		t.Run("case=multi-schema should create the identity and a session and use the correct schema", func(t *testing.T) {
+			conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceRegistrationAfter, identity.CredentialsTypeWebAuthn.String()), []config.SelfServiceHook{{Name: "session"}})
+			conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, "does-not-exist")
+			conf.MustSet(ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+				{ID: "does-not-exist", URL: "file://./stub/profile.schema.json"},
+				{ID: "advanced-user", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+			})
+
+			for _, f := range flows {
+				t.Run("type="+f+" registration success", func(t *testing.T) {
+					email := testhelpers.RandomEmail()
+					actual := makeSuccessfulRegistration(t, f, redirTS.URL+"/registration-return-ts", values(email), testhelpers.InitFlowWithIdentitySchema("advanced-user"))
+
+					prefix := getPrefix(f)
+
+					assert.Equal(t, email, gjson.Get(actual, prefix+"identity.traits.username").String(), "%s", actual)
+					assert.True(t, gjson.Get(actual, prefix+"active").Bool(), "%s", actual)
+
+					i, _, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(context.Background(), identity.CredentialsTypeWebAuthn, email)
+					require.NoError(t, err)
+					assert.Equal(t, email, gjson.GetBytes(i.Traits, "username").String(), "%s", actual)
+				})
+
+				t.Run("type="+f+" registration failure due to invalid form data", func(t *testing.T) {
+					invalidValues := func(v url.Values) {
+						v.Set("traits.username", testhelpers.RandomEmail())
+						v.Set("traits.foobar", "b")
+						v.Set(node.WebAuthnRegister, string(registrationFixtureSuccessResponse))
+						v.Del("method")
+					}
+
+					actual, res, _ := submitWebAuthnRegistrationWithClient(t, f, registrationFixtureSuccessInternalContext, testhelpers.NewClientWithCookies(t), invalidValues, testhelpers.InitFlowWithIdentitySchema("advanced-user"))
+
+					if f == "browser" {
+						assert.Equal(t, http.StatusOK, res.StatusCode, "%s", actual)
+					} else {
+						assert.Equal(t, http.StatusBadRequest, res.StatusCode, "%s", actual)
+					}
+					assert.Equal(t, int64(4000003), gjson.Get(actual, "ui.nodes.#(attributes.name==traits.foobar).messages.0.id").Int(), "%s", actual)
+					assert.Equal(t, "length must be \u003e= 2, but got 1", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.foobar).messages.0.text").String(), "%s", actual)
+				})
+			}
+		})
 	})
 
 	t.Run("case=should fail if no identifier was set in the schema", func(t *testing.T) {
@@ -495,5 +541,91 @@ func TestRegistration(t *testing.T) {
 				assert.Equal(t, text.NewErrorValidationIdentifierMissing().Text, gjson.Get(actual, "ui.messages.0.text").String(), "%s", actual)
 			})
 		}
+	})
+}
+
+func TestPopulateRegistrationMethod(t *testing.T) {
+	ctx := context.Background()
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+
+	ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://stub/registration.schema.json")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyWebAuthnRPID, "localhost")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyWebAuthnRPDisplayName, "localhost")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyWebAuthnPasswordless, true)
+
+	s, err := reg.AllRegistrationStrategies().Strategy(identity.CredentialsTypeWebAuthn)
+	require.NoError(t, err)
+
+	fh, ok := s.(registration.FormHydrator)
+	require.True(t, ok)
+
+	toSnapshot := func(t *testing.T, f node.Nodes, except ...snapshotx.Opt) {
+		t.Helper()
+		// The CSRF token has a unique value that messes with the snapshot - ignore it.
+		f.ResetNodes("csrf_token")
+		snapshotx.SnapshotT(t, f, append(except, snapshotx.ExceptNestedKeys("nonce", "src", "onclick"))...)
+	}
+
+	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *registration.Flow) {
+		r := httptest.NewRequest("GET", "/self-service/registration/browser", nil)
+		r = r.WithContext(ctx)
+		t.Helper()
+		f, err := registration.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f.UI.Nodes = make(node.Nodes, 0)
+		require.NoError(t, err)
+		return r, f
+	}
+
+	t.Run("method=PopulateRegistrationMethod", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethod(r, f))
+		toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("2.attributes.value"))
+	})
+
+	t.Run("method=PopulateRegistrationMethodProfile", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+		toSnapshot(t, f.UI.Nodes)
+	})
+
+	t.Run("method=PopulateRegistrationMethodCredentials", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+		toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("2.attributes.value"))
+	})
+
+	t.Run("method=idempotency", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+
+		var snapshots []node.Nodes
+
+		t.Run("case=1", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=2", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("2.attributes.value"))
+		})
+
+		t.Run("case=3", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes)
+		})
+
+		t.Run("case=4", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("2.attributes.value"))
+		})
+
+		t.Run("case=evaluate", func(t *testing.T) {
+			assertx.EqualAsJSON(t, snapshots[0], snapshots[2])
+			assertx.EqualAsJSONExcept(t, snapshots[1], snapshots[3], []string{"3.attributes.nonce"})
+		})
 	})
 }

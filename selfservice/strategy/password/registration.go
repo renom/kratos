@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+
+	"github.com/ory/x/otelx/semconv"
 
 	"github.com/ory/x/otelx"
 
@@ -22,8 +25,17 @@ import (
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
-	"github.com/ory/x/errorsx"
 )
+
+func nodePasswordInput() *node.Node {
+	return NewPasswordNode("password", node.InputAttributeAutocompleteNewPassword)
+}
+
+func nodeSubmit() *node.Node {
+	return node.NewInputField("method", "password", node.PasswordGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoRegistration())
+}
+
+var _ registration.FormHydrator = new(Strategy)
 
 // Update Registration Flow with Password Method
 //
@@ -60,7 +72,7 @@ func (s *Strategy) RegisterRegistrationRoutes(*x.RouterPublic) {
 
 func (s *Strategy) handleRegistrationError(r *http.Request, f *registration.Flow, p UpdateRegistrationFlowWithPasswordMethod, err error) error {
 	if f != nil {
-		for _, n := range container.NewFromJSON("", node.ProfileGroup, p.Traits, "traits").Nodes {
+		for _, n := range container.NewFromJSON("", node.DefaultGroup, p.Traits, "traits").Nodes {
 			// we only set the value and not the whole field because we want to keep types from the initial form generation
 			f.UI.Nodes.SetValueAttribute(n.ID(), n.Attributes.GetValue())
 		}
@@ -73,20 +85,25 @@ func (s *Strategy) handleRegistrationError(r *http.Request, f *registration.Flow
 	return err
 }
 
-func (s *Strategy) decode(p *UpdateRegistrationFlowWithPasswordMethod, r *http.Request) (err error) {
-	return registration.DecodeBody(p, r, s.hd, s.d.Config(), registrationSchema)
+func (s *Strategy) decode(p *UpdateRegistrationFlowWithPasswordMethod, r *http.Request, ds *url.URL) (err error) {
+	return registration.DecodeBody(p, r, s.hd, s.d.Config(), registrationSchema, ds)
 }
 
 func (s *Strategy) Register(_ http.ResponseWriter, r *http.Request, f *registration.Flow, i *identity.Identity) (err error) {
-	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.password.strategy.Register")
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.password.Strategy.Register")
 	defer otelx.End(span, &err)
 
 	if err := flow.MethodEnabledAndAllowedFromRequest(r, f.GetFlowName(), s.ID().String(), s.d); err != nil {
 		return err
 	}
 
+	ds, err := f.IdentitySchema.URL(ctx, s.d.Config())
+	if err != nil {
+		return err
+	}
+
 	var p UpdateRegistrationFlowWithPasswordMethod
-	if err := s.decode(&p, r); err != nil {
+	if err := s.decode(&p, r, ds); err != nil {
 		return s.handleRegistrationError(r, f, p, err)
 	}
 
@@ -148,7 +165,7 @@ func (s *Strategy) Register(_ http.ResponseWriter, r *http.Request, f *registrat
 }
 
 func (s *Strategy) validateCredentials(ctx context.Context, i *identity.Identity, pw string) (err error) {
-	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.password.strategy.validateCredentials")
+	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.password.Strategy.validateCredentials")
 	defer otelx.End(span, &err)
 
 	if err := s.d.IdentityValidator().Validate(ctx, i); err != nil {
@@ -165,7 +182,7 @@ func (s *Strategy) validateCredentials(ctx context.Context, i *identity.Identity
 
 	for _, id := range c.Identifiers {
 		if err := s.d.PasswordValidator().Validate(ctx, id, pw); err != nil {
-			if _, ok := errorsx.Cause(err).(*herodot.DefaultError); ok {
+			if herodotErr := new(herodot.DefaultError); errors.As(err, &herodotErr) {
 				return err
 			}
 			if message := new(text.Message); errors.As(err, &message) {
@@ -178,24 +195,59 @@ func (s *Strategy) validateCredentials(ctx context.Context, i *identity.Identity
 	return nil
 }
 
-func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) error {
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) (err error) {
+	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.password.Strategy.PopulateRegistrationMethod")
+	defer otelx.End(span, &err)
+
+	ds, err := f.IdentitySchema.URL(ctx, s.d.Config())
 	if err != nil {
 		return err
 	}
 
-	nodes, err := container.NodesFromJSONSchema(r.Context(), node.PasswordGroup, ds.String(), "", nil)
-	if err != nil {
-		return err
-	}
+	// The group used to be `password`, but to make it consistent with other methods and two-step registration,
+	// it is now `default`. To make this switch backwards compatible, this feature flag is used.
+	//
+	// Previously, the behavior would be that the group of NodesFromJSONSchema would be `password`, but as soon
+	// as any other method (code, passkeys, two-step) would be enabled, the group would be `default`.
+	//
+	// Going forward, the default is that the group is `default` and the feature flag is not set.
+	//
+	// TODO remove me when everyone has migrated.
+	if !s.d.Config().SelfServiceFlowRegistrationTwoSteps(r.Context()) && node.UiNodeGroup(s.d.Config().SelfServiceFlowRegistrationPasswordMethodProfileGroup(r.Context())) == node.PasswordGroup {
+		span.AddEvent(semconv.NewDeprecatedFeatureUsedEvent(ctx, "password_profile_registration_node_group=password"))
 
-	for _, n := range nodes {
-		f.UI.SetNode(n)
+		// This is the legacy code path. In the new code path, the profile method is responsible for hydrating the form
+		// nodes. In the old code path, the password method is responsible for hydrating the form nodes if it is
+		// the only method enabled.
+		nodes, err := container.NodesFromJSONSchema(r.Context(), node.PasswordGroup, ds.String(), "", nil)
+		if err != nil {
+			return err
+		}
+
+		for _, n := range nodes {
+			f.UI.SetNode(n)
+		}
 	}
+	// TODO end
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
-	f.UI.Nodes.Upsert(NewPasswordNode("password", node.InputAttributeAutocompleteNewPassword))
-	f.UI.Nodes.Append(node.NewInputField("method", "password", node.PasswordGroup, node.InputAttributeTypeSubmit).WithMetaLabel(text.NewInfoRegistration()))
+	f.UI.Nodes.Upsert(nodePasswordInput())
+	f.UI.Nodes.Upsert(nodeSubmit())
 
+	return nil
+}
+
+func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
+	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
+	f.UI.Nodes.Upsert(nodePasswordInput())
+	f.UI.Nodes.Upsert(nodeSubmit())
+	return nil
+}
+
+func (s *Strategy) PopulateRegistrationMethodProfile(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
+	// The profile method is responsible for rendering the profile form fields.
+	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
+	f.UI.Nodes.RemoveMatching(nodePasswordInput())
+	f.UI.Nodes.RemoveMatching(nodeSubmit())
 	return nil
 }

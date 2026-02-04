@@ -85,20 +85,20 @@ func (p *ProviderVK) OAuth2(ctx context.Context) (*oauth2.Config, error) {
 func (p *ProviderVK) Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error) {
 	o, err := p.OAuth2(ctx)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, err
 	}
 
 	ctx, client := httpx.SetOAuth2(ctx, p.reg.HTTPClient(ctx), o, exchange)
 	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", "https://api.vk.com/method/users.get?fields=photo_200,nickname,bdate,sex&access_token="+exchange.AccessToken+"&v=5.103", nil)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if err := logUpstreamError(p.reg.Logger(), resp); err != nil {
 		return nil, err
@@ -121,11 +121,11 @@ func (p *ProviderVK) Claims(ctx context.Context, exchange *oauth2.Token, query u
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
 	if len(response.Result) == 0 {
-		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("VK did not return a user in the userinfo request."))
+		return nil, errors.WithStack(herodot.ErrUpstreamError.WithReasonf("VK did not return a user in the userinfo request."))
 	}
 
 	user := response.Result[0]

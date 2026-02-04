@@ -7,19 +7,17 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/ory/kratos/courier/template/email"
-
 	"github.com/pkg/errors"
 
-	"github.com/ory/x/sqlcon"
-	"github.com/ory/x/urlx"
-
 	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/courier/template/email"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/urlx"
 )
 
 type (
@@ -244,7 +242,7 @@ func (s *Sender) SendVerificationTokenTo(ctx context.Context, f *verification.Fl
 		return err
 	}
 	address.Status = identity.VerifiableAddressStatusSent
-	if err := s.r.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, address); err != nil {
+	if err := s.r.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, address, "status"); err != nil {
 		return err
 	}
 	return nil

@@ -14,16 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
+	"github.com/dgraph-io/ristretto/v2"
 	"github.com/google/go-jsonnet"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/pkg/errors"
-	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/ory/herodot"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/fetcher"
 	"github.com/ory/x/jsonnetsecure"
 	"github.com/ory/x/otelx"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var ErrCancel = errors.New("request cancel by JsonNet")
@@ -41,48 +43,70 @@ type (
 		jsonnetsecure.VMProvider
 	}
 	Builder struct {
-		r      *retryablehttp.Request
-		Config *Config
-		deps   Dependencies
-		cache  *ristretto.Cache
+		r            *retryablehttp.Request
+		Config       *Config
+		deps         Dependencies
+		cache        *ristretto.Cache[[]byte, []byte]
+		bodySizeHint uint
 	}
+	options struct {
+		cache        *ristretto.Cache[[]byte, []byte]
+		bodySizeHint uint
+	}
+	BuilderOption = func(*options)
 )
 
-func NewBuilder(ctx context.Context, config json.RawMessage, deps Dependencies, jsonnetCache *ristretto.Cache) (_ *Builder, err error) {
+func WithCache(cache *ristretto.Cache[[]byte, []byte]) BuilderOption {
+	return func(o *options) {
+		o.cache = cache
+	}
+}
+
+func WithBodySizeHint(hint uint) BuilderOption {
+	return func(o *options) {
+		o.bodySizeHint = hint
+	}
+}
+
+func NewBuilder(ctx context.Context, c *Config, deps Dependencies, o ...BuilderOption) (_ *Builder, err error) {
 	_, span := deps.Tracer(ctx).Tracer().Start(ctx, "request.NewBuilder")
 	defer otelx.End(span, &err)
 
-	c, err := parseConfig(config)
-	if err != nil {
-		return nil, err
+	var opts options
+	for _, f := range o {
+		f(&opts)
 	}
 
-	span.SetAttributes(attribute.String("url", c.URL), attribute.String("method", c.Method))
+	span.SetAttributes(
+		attribute.String("url", c.URL),
+		attribute.String("method", c.Method),
+	)
 
 	r, err := retryablehttp.NewRequest(c.Method, c.URL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Builder{
-		r:      r,
-		Config: c,
-		deps:   deps,
-		cache:  jsonnetCache,
-	}, nil
-}
-
-func (b *Builder) addAuth() error {
-	authConfig := b.Config.Auth
-
-	strategy, err := authStrategy(authConfig.Type, authConfig.Config)
-	if err != nil {
-		return err
+	c.header = make(http.Header, len(c.Headers))
+	for k, v := range c.Headers {
+		c.header.Add(k, v)
+	}
+	if c.header.Get("Content-Type") == "" {
+		c.header.Set("Content-Type", ContentTypeJSON)
 	}
 
-	strategy.apply(b.r)
+	c.auth, err = authStrategy(c.Auth.Type, c.Auth.Config)
+	if err != nil {
+		return nil, err
+	}
 
-	return nil
+	return &Builder{
+		r:            r,
+		Config:       c,
+		deps:         deps,
+		cache:        opts.cache,
+		bodySizeHint: opts.bodySizeHint,
+	}, nil
 }
 
 func (b *Builder) addBody(ctx context.Context, body interface{}) (err error) {
@@ -93,8 +117,6 @@ func (b *Builder) addBody(ctx context.Context, body interface{}) (err error) {
 		return nil
 	}
 
-	contentType := b.r.Header.Get("Content-Type")
-
 	if b.Config.TemplateURI == "" {
 		return errors.New("got empty template path for request with body")
 	}
@@ -104,11 +126,14 @@ func (b *Builder) addBody(ctx context.Context, body interface{}) (err error) {
 		return err
 	}
 
-	switch contentType {
+	switch b.r.Header.Get("Content-Type") {
 	case ContentTypeForm:
 		if err := b.addURLEncodedBody(ctx, tpl, body); err != nil {
 			return err
 		}
+	case "":
+		b.r.Header.Set("Content-Type", ContentTypeJSON)
+		fallthrough
 	case ContentTypeJSON:
 		if err := b.addJSONBody(ctx, tpl, body); err != nil {
 			return err
@@ -121,7 +146,7 @@ func (b *Builder) addBody(ctx context.Context, body interface{}) (err error) {
 }
 
 func (b *Builder) addJSONBody(ctx context.Context, jsonnetSnippet []byte, body interface{}) error {
-	buf := new(bytes.Buffer)
+	buf := bytes.NewBuffer(make([]byte, 0, b.bodySizeHint))
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "")
@@ -159,7 +184,7 @@ func (b *Builder) addJSONBody(ctx context.Context, jsonnetSnippet []byte, body i
 }
 
 func (b *Builder) addURLEncodedBody(ctx context.Context, jsonnetSnippet []byte, body interface{}) error {
-	buf := new(bytes.Buffer)
+	buf := bytes.NewBuffer(make([]byte, 0, b.bodySizeHint))
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "")
@@ -199,15 +224,54 @@ func (b *Builder) addURLEncodedBody(ctx context.Context, jsonnetSnippet []byte, 
 }
 
 func (b *Builder) BuildRequest(ctx context.Context, body interface{}) (*retryablehttp.Request, error) {
-	b.r.Header = b.Config.Header
-	if err := b.addAuth(); err != nil {
-		return nil, err
-	}
+	b.r.Header = b.Config.header
+	b.Config.auth.apply(b.r)
 
 	// According to the HTTP spec any request method, but TRACE is allowed to
 	// have a body. Even this is a bad practice for some of them, like for GET
 	if b.Config.Method != http.MethodTrace {
 		if err := b.addBody(ctx, body); err != nil {
+			return nil, err
+		}
+	}
+
+	return b.r, nil
+}
+
+func (b *Builder) addRawBody(body any) (err error) {
+	if isNilInterface(body) {
+		return nil
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, b.bodySizeHint))
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+
+	if err := enc.Encode(body); err != nil {
+		return errors.WithStack(err)
+	}
+	switch contentType := b.r.Header.Get("Content-Type"); contentType {
+	case "":
+		b.r.Header.Set("Content-Type", ContentTypeJSON)
+		fallthrough
+	case ContentTypeJSON:
+		if err := b.r.SetBody(buf); err != nil {
+			return errors.WithStack(err)
+		}
+	default:
+		return herodot.ErrMisconfiguration.WithDetail("invalid_content_type", contentType)
+	}
+
+	return nil
+}
+
+func (b *Builder) BuildRawRequest(body any) (*retryablehttp.Request, error) {
+	b.r.Header = b.Config.header
+	b.Config.auth.apply(b.r)
+
+	// According to the HTTP spec any request method, but TRACE is allowed to
+	// have a body. Even this is a bad practice for some of them, like for GET
+	if b.Config.Method != http.MethodTrace {
+		if err := b.addRawBody(body); err != nil {
 			return nil, err
 		}
 	}
@@ -242,5 +306,5 @@ func (b *Builder) readTemplate(ctx context.Context) ([]byte, error) {
 }
 
 func isNilInterface(i interface{}) bool {
-	return i == nil || (reflect.ValueOf(i).Kind() == reflect.Ptr && reflect.ValueOf(i).IsNil())
+	return i == nil || (reflect.ValueOf(i).Kind() == reflect.Pointer && reflect.ValueOf(i).IsNil())
 }

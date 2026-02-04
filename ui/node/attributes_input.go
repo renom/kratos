@@ -8,6 +8,7 @@ import (
 
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/jsonschemax"
 )
 
@@ -15,7 +16,7 @@ const DisableFormField = "disableFormField"
 
 func toFormType(n string, i interface{}) UiNodeInputAttributeType {
 	switch n {
-	case x.CSRFTokenName:
+	case nosurfx.CSRFTokenName:
 		return InputAttributeTypeHidden
 	case "password":
 		return InputAttributeTypePassword
@@ -31,8 +32,10 @@ func toFormType(n string, i interface{}) UiNodeInputAttributeType {
 	return InputAttributeTypeText
 }
 
-type InputAttributesModifier func(attributes *InputAttributes)
-type InputAttributesModifiers []InputAttributesModifier
+type (
+	InputAttributesModifier  func(attributes *InputAttributes)
+	InputAttributesModifiers []InputAttributesModifier
+)
 
 func WithRequiredInputAttribute(a *InputAttributes) {
 	a.Required = true
@@ -57,8 +60,10 @@ func applyInputAttributes(opts []InputAttributesModifier, attributes *InputAttri
 	return attributes
 }
 
-type ImageAttributesModifier func(attributes *ImageAttributes)
-type ImageAttributesModifiers []ImageAttributesModifier
+type (
+	ImageAttributesModifier  func(attributes *ImageAttributes)
+	ImageAttributesModifiers []ImageAttributesModifier
+)
 
 func WithImageAttributes(f func(a *ImageAttributes)) func(a *ImageAttributes) {
 	return func(a *ImageAttributes) {
@@ -73,10 +78,30 @@ func applyImageAttributes(opts ImageAttributesModifiers, attributes *ImageAttrib
 	return attributes
 }
 
-type ScriptAttributesModifier func(attributes *ScriptAttributes)
-type ScriptAttributesModifiers []ScriptAttributesModifier
+type (
+	ScriptAttributesModifier  func(attributes *ScriptAttributes)
+	ScriptAttributesModifiers []ScriptAttributesModifier
+)
 
 func applyScriptAttributes(opts ScriptAttributesModifiers, attributes *ScriptAttributes) *ScriptAttributes {
+	for _, f := range opts {
+		f(attributes)
+	}
+	return attributes
+}
+
+type (
+	DivisionAttributesModifier  func(attributes *DivisionAttributes)
+	DivisionAttributesModifiers []DivisionAttributesModifier
+)
+
+func WithDivisionAttributes(f func(a *DivisionAttributes)) func(a *DivisionAttributes) {
+	return func(a *DivisionAttributes) {
+		f(a)
+	}
+}
+
+func applyDivisionAttributes(opts DivisionAttributesModifiers, attributes *DivisionAttributes) *DivisionAttributes {
 	for _, f := range opts {
 		f(attributes)
 	}
@@ -115,6 +140,15 @@ func NewTextField(id string, text *text.Message, group UiNodeGroup) *Node {
 		Type:       Text,
 		Group:      group,
 		Attributes: &TextAttributes{Text: text, Identifier: id},
+		Meta:       &Meta{},
+	}
+}
+
+func NewDivisionField(id string, group UiNodeGroup, opts ...DivisionAttributesModifier) *Node {
+	return &Node{
+		Type:       Division,
+		Group:      group,
+		Attributes: applyDivisionAttributes(opts, &DivisionAttributes{Identifier: id}),
 		Meta:       &Meta{},
 	}
 }
@@ -186,7 +220,7 @@ func NewInputFieldFromSchema(name string, group UiNodeGroup, p jsonschemax.Path,
 
 	var meta Meta
 	if len(p.Title) > 0 {
-		meta.Label = text.NewInfoNodeLabelGenerated(p.Title)
+		meta.Label = text.NewInfoNodeLabelGenerated(p.Title, name)
 	}
 
 	return &Node{

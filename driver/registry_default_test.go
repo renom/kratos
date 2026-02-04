@@ -5,32 +5,29 @@ package driver_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
+	"io"
+	"net/http"
 	"testing"
-
-	confighelpers "github.com/ory/kratos/driver/config/testhelpers"
-
-	"github.com/ory/x/contextx"
-
-	"github.com/ory/kratos/selfservice/flow/recovery"
-
-	"github.com/ory/kratos/selfservice/flow/verification"
-
-	"github.com/ory/kratos/driver"
-	"github.com/ory/x/configx"
-	"github.com/ory/x/logrusx"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/contextx"
+	"github.com/ory/x/logrusx"
+
+	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/request"
 	"github.com/ory/kratos/selfservice/flow/login"
+	"github.com/ory/kratos/selfservice/flow/recovery"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/selfservice/flow/settings"
+	"github.com/ory/kratos/selfservice/flow/verification"
 	"github.com/ory/kratos/selfservice/hook"
 )
 
@@ -49,8 +46,10 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			expect func(reg *driver.RegistryDefault) []verification.PreHookExecutor
 		}{
 			{
-				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []verification.PreHookExecutor { return nil },
+				uc: "No hooks configured",
+				expect: func(reg *driver.RegistryDefault) []verification.PreHookExecutor {
+					return []verification.PreHookExecutor{}
+				},
 			},
 			{
 				uc: "Two web_hooks are configured",
@@ -62,8 +61,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []verification.PreHookExecutor {
 					return []verification.PreHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -71,13 +70,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PreVerificationHooks(ctx)
+				h, err := reg.PreVerificationHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 
@@ -89,9 +87,11 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			expect func(reg *driver.RegistryDefault) []verification.PostHookExecutor
 		}{
 			{
-				uc:     "No hooks configured",
-				prep:   func(conf *config.Config) {},
-				expect: func(reg *driver.RegistryDefault) []verification.PostHookExecutor { return nil },
+				uc:   "No hooks configured",
+				prep: func(conf *config.Config) {},
+				expect: func(reg *driver.RegistryDefault) []verification.PostHookExecutor {
+					return []verification.PostHookExecutor{}
+				},
 			},
 			{
 				uc: "Multiple web_hooks configured",
@@ -103,8 +103,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []verification.PostHookExecutor {
 					return []verification.PostHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -112,13 +112,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PostVerificationHooks(ctx)
+				h, err := reg.PostVerificationHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 	})
@@ -133,7 +132,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 		}{
 			{
 				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []recovery.PreHookExecutor { return nil },
+				expect: func(reg *driver.RegistryDefault) []recovery.PreHookExecutor { return []recovery.PreHookExecutor{} },
 			},
 			{
 				uc: "Two web_hooks are configured",
@@ -145,8 +144,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []recovery.PreHookExecutor {
 					return []recovery.PreHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -154,13 +153,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PreRecoveryHooks(ctx)
+				h, err := reg.PreRecoveryHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 
@@ -172,7 +170,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 		}{
 			{
 				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []recovery.PostHookExecutor { return nil },
+				expect: func(reg *driver.RegistryDefault) []recovery.PostHookExecutor { return []recovery.PostHookExecutor{} },
 			},
 			{
 				uc: "Multiple web_hooks configured",
@@ -184,8 +182,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []recovery.PostHookExecutor {
 					return []recovery.PostHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -193,13 +191,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PostRecoveryHooks(ctx)
+				h, err := reg.PostRecoveryHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 	})
@@ -215,9 +212,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			{
 				uc: "No hooks configured",
 				expect: func(reg *driver.RegistryDefault) []registration.PreHookExecutor {
-					return []registration.PreHookExecutor{
-						hook.NewTwoStepRegistration(reg),
-					}
+					return []registration.PreHookExecutor{}
 				},
 			},
 			{
@@ -230,9 +225,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []registration.PreHookExecutor {
 					return []registration.PreHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
-						hook.NewTwoStepRegistration(reg),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -240,13 +234,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PreRegistrationHooks(ctx)
+				h, err := reg.PreRegistrationHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.EqualValues(t, tc.expect(reg), h)
 			})
 		}
 
@@ -257,8 +250,10 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			expect func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor
 		}{
 			{
-				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor { return nil },
+				uc: "No hooks configured",
+				expect: func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor {
+					return []registration.PostHookPostPersistExecutor{}
+				},
 			},
 			{
 				uc: "Only session hook configured for password strategy",
@@ -287,7 +282,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				expect: func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor {
 					return []registration.PostHookPostPersistExecutor{
 						hook.NewVerifier(reg),
-						hook.NewWebHook(reg, json.RawMessage(`{"body":"bar","headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
+						hook.NewWebHook(reg, &request.Config{URL: "foo", Method: "POST", TemplateURI: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 						hook.NewSessionIssuer(reg),
 					}
 				},
@@ -302,8 +297,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor {
 					return []registration.PostHookPostPersistExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -322,7 +317,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				expect: func(reg *driver.RegistryDefault) []registration.PostHookPostPersistExecutor {
 					return []registration.PostHookPostPersistExecutor{
 						hook.NewVerifier(reg),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"foo"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
 						hook.NewSessionIssuer(reg),
 					}
 				},
@@ -344,13 +339,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PostRegistrationPostPersistHooks(ctx, identity.CredentialsTypePassword)
+				h, err := reg.PostRegistrationPostPersistHooks(ctx, identity.CredentialsTypePassword)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 	})
@@ -365,7 +359,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 		}{
 			{
 				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []login.PreHookExecutor { return nil },
+				expect: func(reg *driver.RegistryDefault) []login.PreHookExecutor { return []login.PreHookExecutor{} },
 			},
 			{
 				uc: "Two web_hooks are configured",
@@ -377,8 +371,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []login.PreHookExecutor {
 					return []login.PreHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -386,13 +380,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PreLoginHooks(ctx)
+				h, err := reg.PreLoginHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 
@@ -404,7 +397,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 		}{
 			{
 				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor { return nil },
+				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor { return []login.PostHookExecutor{} },
 			},
 			{
 				uc: "Only revoke_active_sessions hook configured for password strategy",
@@ -428,7 +421,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor {
 					return []login.PostHookExecutor{
-						hook.NewAddressVerifier(),
+						hook.NewAddressVerifier(reg),
 					}
 				},
 			},
@@ -443,8 +436,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor {
 					return []login.PostHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"body":"bar","headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewAddressVerifier(),
+						hook.NewWebHook(reg, &request.Config{TemplateURI: "bar", Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewAddressVerifier(reg),
 						hook.NewSessionDestroyer(reg),
 					}
 				},
@@ -459,8 +452,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor {
 					return []login.PostHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -478,9 +471,9 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []login.PostHookExecutor {
 					return []login.PostHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"foo"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
 						hook.NewSessionDestroyer(reg),
-						hook.NewAddressVerifier(),
+						hook.NewAddressVerifier(reg),
 					}
 				},
 			},
@@ -488,13 +481,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PostLoginHooks(ctx, identity.CredentialsTypePassword)
+				h, err := reg.PostLoginHooks(ctx, identity.CredentialsTypePassword)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 	})
@@ -509,7 +501,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 		}{
 			{
 				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []settings.PreHookExecutor { return nil },
+				expect: func(reg *driver.RegistryDefault) []settings.PreHookExecutor { return []settings.PreHookExecutor{} },
 			},
 			{
 				uc: "Two web_hooks are configured",
@@ -521,8 +513,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []settings.PreHookExecutor {
 					return []settings.PreHookExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -530,13 +522,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("before/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PreSettingsHooks(ctx)
+				h, err := reg.PreSettingsHooks(ctx)
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 
@@ -547,8 +538,10 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			expect func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor
 		}{
 			{
-				uc:     "No hooks configured",
-				expect: func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor { return nil },
+				uc: "No hooks configured",
+				expect: func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor {
+					return []settings.PostHookPostPersistExecutor{}
+				},
 			},
 			{
 				uc: "Only verify hook configured for the strategy",
@@ -568,14 +561,14 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				uc: "A verify hook and a web_hook are configured for profile strategy",
 				config: map[string]any{
 					config.ViperKeySelfServiceSettingsAfter + ".profile.hooks": []map[string]any{
-						{"hook": "web_hook", "config": map[string]any{"headers": []map[string]string{{"X-Custom-Header": "test"}}, "url": "foo", "method": "POST", "body": "bar"}},
+						{"hook": "web_hook", "config": map[string]any{"headers": map[string]string{"X-Custom-Header": "test"}, "url": "foo", "method": "POST", "body": "bar"}},
 					},
 					config.ViperKeySelfServiceVerificationEnabled: true,
 				},
 				expect: func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor {
 					return []settings.PostHookPostPersistExecutor{
 						hook.NewVerifier(reg),
-						hook.NewWebHook(reg, json.RawMessage(`{"body":"bar","headers":[{"X-Custom-Header":"test"}],"method":"POST","url":"foo"}`)),
+						hook.NewWebHook(reg, &request.Config{TemplateURI: "bar", Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -589,8 +582,8 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				},
 				expect: func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor {
 					return []settings.PostHookPostPersistExecutor{
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"POST","url":"foo"}`)),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"bar"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "POST", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "bar", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -608,7 +601,7 @@ func TestDriverDefault_Hooks(t *testing.T) {
 				expect: func(reg *driver.RegistryDefault) []settings.PostHookPostPersistExecutor {
 					return []settings.PostHookPostPersistExecutor{
 						hook.NewVerifier(reg),
-						hook.NewWebHook(reg, json.RawMessage(`{"headers":{"X-Custom-Header":"test"},"method":"GET","url":"foo"}`)),
+						hook.NewWebHook(reg, &request.Config{Method: "GET", URL: "foo", Headers: map[string]string{"X-Custom-Header": "test"}}),
 					}
 				},
 			},
@@ -616,13 +609,12 @@ func TestDriverDefault_Hooks(t *testing.T) {
 			t.Run(fmt.Sprintf("after/uc=%s", tc.uc), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
-				h := reg.PostSettingsPostPersistHooks(ctx, "profile")
+				h, err := reg.PostSettingsPostPersistHooks(ctx, "profile")
+				require.NoError(t, err)
 
-				expectedExecutors := tc.expect(reg)
-				require.Len(t, h, len(expectedExecutors))
-				assert.Equal(t, expectedExecutors, h)
+				assert.Equal(t, tc.expect(reg), h)
 			})
 		}
 	})
@@ -654,7 +646,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 					config.ViperKeySelfServiceStrategyConfig + ".password.enabled": true,
 					config.ViperKeySelfServiceStrategyConfig + ".code.enabled":     false,
 				},
-				expect: []string{"password", "profile"},
+				expect: []string{"profile", "password"},
 			},
 			{
 				name: "oidc and password",
@@ -663,7 +655,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 					config.ViperKeySelfServiceStrategyConfig + ".password.enabled": true,
 					config.ViperKeySelfServiceStrategyConfig + ".code.enabled":     false,
 				},
-				expect: []string{"password", "oidc", "profile"},
+				expect: []string{"profile", "password", "oidc"},
 			},
 			{
 				name: "oidc, password and totp",
@@ -673,7 +665,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 					config.ViperKeySelfServiceStrategyConfig + ".totp.enabled":     true,
 					config.ViperKeySelfServiceStrategyConfig + ".code.enabled":     false,
 				},
-				expect: []string{"password", "oidc", "profile"},
+				expect: []string{"profile", "password", "oidc"},
 			},
 			{
 				name: "password and code",
@@ -681,13 +673,13 @@ func TestDriverDefault_Strategies(t *testing.T) {
 					config.ViperKeySelfServiceStrategyConfig + ".password.enabled": true,
 					config.ViperKeySelfServiceStrategyConfig + ".code.enabled":     true,
 				},
-				expect: []string{"password", "profile", "code"},
+				expect: []string{"profile", "password", "code"},
 			},
 		} {
 			t.Run(fmt.Sprintf("subcase=%s", tc.name), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 				s := reg.RegistrationStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
 				for k, e := range tc.expect {
@@ -760,7 +752,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			t.Run(fmt.Sprintf("run=%s", tc.name), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 				s := reg.LoginStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
 				for k, e := range tc.expect {
@@ -792,7 +784,7 @@ func TestDriverDefault_Strategies(t *testing.T) {
 			t.Run(fmt.Sprintf("run=%d", k), func(t *testing.T) {
 				t.Parallel()
 
-				ctx := confighelpers.WithConfigValues(ctx, tc.config)
+				ctx := contextx.WithConfigValues(ctx, tc.config)
 
 				s := reg.RecoveryStrategies(ctx)
 				require.Len(t, s, len(tc.expect))
@@ -840,18 +832,18 @@ func TestDriverDefault_Strategies(t *testing.T) {
 				configOptions: []configx.OptionModifier{configx.WithValues(map[string]any{
 					config.ViperKeyDSN: config.DefaultSQLiteMemoryDSN,
 				})},
-				expect: []string{"password", "profile"},
+				expect: []string{"profile", "password"},
 			},
 			{
 				configOptions: []configx.OptionModifier{
 					configx.WithConfigFiles("../test/e2e/profiles/verification/.kratos.yml"),
 					configx.WithValue(config.ViperKeyDSN, config.DefaultSQLiteMemoryDSN),
 				},
-				expect: []string{"password", "profile"},
+				expect: []string{"profile", "password"},
 			},
 		} {
 			t.Run(fmt.Sprintf("run=%d", k), func(t *testing.T) {
-				conf := config.MustNew(t, l, os.Stderr, &contextx.Default{}, append(tc.configOptions, configx.SkipValidation())...)
+				conf := config.MustNew(t, l, &contextx.Default{}, append(tc.configOptions, configx.SkipValidation())...)
 
 				reg, err := driver.NewRegistryFromDSN(ctx, conf, l)
 				require.NoError(t, err)
@@ -881,7 +873,7 @@ func TestDefaultRegistry_AllStrategies(t *testing.T) {
 	})
 
 	t.Run("case=all registration strategies", func(t *testing.T) {
-		expects := []string{"password", "oidc", "profile", "code", "passkey", "webauthn"}
+		expects := []string{"profile", "password", "oidc", "code", "passkey", "webauthn"}
 		s := reg.AllRegistrationStrategies()
 		require.Len(t, s, len(expects))
 		for k, e := range expects {
@@ -890,7 +882,7 @@ func TestDefaultRegistry_AllStrategies(t *testing.T) {
 	})
 
 	t.Run("case=all settings strategies", func(t *testing.T) {
-		expects := []string{"password", "oidc", "profile", "totp", "passkey", "webauthn", "lookup_secret"}
+		expects := []string{"profile", "password", "oidc", "totp", "passkey", "webauthn", "lookup_secret"}
 		s := reg.AllSettingsStrategies()
 		require.Len(t, s, len(expects))
 		for k, e := range expects {
@@ -914,7 +906,7 @@ func TestGetActiveRecoveryStrategy(t *testing.T) {
 	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
 
 	t.Run("returns error if active strategy is disabled", func(t *testing.T) {
-		ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+		ctx := contextx.WithConfigValues(ctx, map[string]any{
 			"selfservice.methods.code.enabled":    false,
 			config.ViperKeySelfServiceRecoveryUse: "code",
 		})
@@ -928,7 +920,7 @@ func TestGetActiveRecoveryStrategy(t *testing.T) {
 			"code", "link",
 		} {
 			t.Run(fmt.Sprintf("strategy=%s", sID), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+				ctx := contextx.WithConfigValues(ctx, map[string]any{
 					fmt.Sprintf("selfservice.methods.%s.enabled", sID): true,
 					config.ViperKeySelfServiceRecoveryUse:              sID,
 				})
@@ -946,7 +938,7 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 	ctx := context.Background()
 	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
 	t.Run("returns error if active strategy is disabled", func(t *testing.T) {
-		ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+		ctx := contextx.WithConfigValues(ctx, map[string]any{
 			"selfservice.methods.code.enabled":        false,
 			config.ViperKeySelfServiceVerificationUse: "code",
 		})
@@ -959,7 +951,7 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 			"code", "link",
 		} {
 			t.Run(fmt.Sprintf("strategy=%s", sID), func(t *testing.T) {
-				ctx := confighelpers.WithConfigValues(ctx, map[string]any{
+				ctx := contextx.WithConfigValues(ctx, map[string]any{
 					fmt.Sprintf("selfservice.methods.%s.enabled", sID): true,
 					config.ViperKeySelfServiceVerificationUse:          sID,
 				})
@@ -970,4 +962,27 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestMetricsRouterPaths(t *testing.T) {
+	t.Parallel()
+	_, reg := internal.NewVeryFastRegistryWithoutDB(t)
+	publicTS, adminTS := testhelpers.NewKratosServerWithCSRF(t, reg)
+
+	// Make some requests that should be recorded in the metrics
+	req, _ := http.NewRequest(http.MethodDelete, publicTS.URL+"/sessions/session-id", nil)
+	_, err := publicTS.Client().Do(req)
+	require.NoError(t, err)
+	_, err = adminTS.Client().Get(adminTS.URL + "/admin/identities/some-id/sessions")
+	require.NoError(t, err)
+
+	res, err := adminTS.Client().Get(adminTS.URL + "/admin/metrics/prometheus")
+	require.NoError(t, err)
+	require.EqualValues(t, http.StatusOK, res.StatusCode)
+	respBody, err := io.ReadAll(res.Body)
+	body := string(respBody)
+
+	require.NoError(t, err)
+	assert.Contains(t, body, `endpoint="DELETE /sessions/{param}"`, body)
+	assert.Contains(t, body, `endpoint="GET /admin/identities/{param}/sessions"`, body)
 }

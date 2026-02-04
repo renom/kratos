@@ -8,8 +8,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
@@ -25,7 +26,11 @@ import (
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/events"
+	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -47,8 +52,8 @@ type (
 		session.HandlerProvider
 		session.ManagementProvider
 		x.WriterProvider
-		x.CSRFTokenGeneratorProvider
-		x.CSRFProvider
+		nosurfx.CSRFTokenGeneratorProvider
+		nosurfx.CSRFProvider
 		StrategyProvider
 		HookExecutorProvider
 		FlowPersistenceProvider
@@ -82,21 +87,21 @@ func (h *Handler) RegisterPublicRoutes(public *x.RouterPublic) {
 	public.GET(RouteSubmitFlow, h.d.SessionHandler().IsNotAuthenticated(h.updateRegistrationFlow, h.onAuthenticated))
 }
 
-func (h *Handler) onAuthenticated(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) onAuthenticated(w http.ResponseWriter, r *http.Request) {
 	handler := session.RedirectOnAuthenticated(h.d)
 	if x.IsJSONRequest(r) {
 		handler = session.RespondWithJSONErrorOnAuthenticated(h.d.Writer(), ErrAlreadyLoggedIn)
 	}
 
-	handler(w, r, ps)
+	handler(w, r)
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *x.RouterAdmin) {
-	admin.GET(RouteInitBrowserFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteInitAPIFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteGetFlow, x.RedirectToPublicRoute(h.d))
-	admin.POST(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
-	admin.GET(RouteSubmitFlow, x.RedirectToPublicRoute(h.d))
+	admin.GET(RouteInitBrowserFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteInitAPIFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteGetFlow, redir.RedirectToPublicRoute(h.d))
+	admin.POST(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
+	admin.GET(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
 }
 
 type FlowOption func(f *Flow)
@@ -134,23 +139,28 @@ func (h *Handler) NewRegistrationFlow(w http.ResponseWriter, r *http.Request, ft
 		f.SessionTokenExchangeCode = e.InitCode
 	}
 
-	var strategyFilters []StrategyFilter
-	if rawOrg := r.URL.Query().Get("organization"); rawOrg != "" {
-		orgID, err := uuid.FromString(rawOrg)
-		if err != nil {
-			h.d.Logger().WithError(err).Warnf("ignoring invalid UUID %q in query parameter `organization`", rawOrg)
-		} else {
-			f.OrganizationID = uuid.NullUUID{UUID: orgID, Valid: true}
-			strategyFilters = []StrategyFilter{func(s Strategy) bool { return s.ID() == identity.CredentialsTypeOIDC }}
+	for _, s := range h.d.RegistrationStrategies(r.Context(), PrepareOrganizations(r, f)...) {
+		var populateErr error
+
+		switch strategy := s.(type) {
+		case FormHydrator:
+			if h.d.Config().SelfServiceFlowRegistrationTwoSteps(r.Context()) {
+				populateErr = strategy.PopulateRegistrationMethodProfile(r, f)
+			} else {
+				populateErr = strategy.PopulateRegistrationMethod(r, f)
+			}
+		case UnifiedFormHydrator:
+			populateErr = strategy.PopulateRegistrationMethod(r, f)
+		default:
+			populateErr = errors.WithStack(x.PseudoPanic.WithReasonf("A registration strategy was expected to implement one of the interfaces UnifiedFormHydrator or FormHydrator but did not."))
 		}
-	}
-	for _, s := range h.d.RegistrationStrategies(r.Context(), strategyFilters...) {
-		if err := s.PopulateRegistrationMethod(r, f); err != nil {
-			return nil, err
+
+		if populateErr != nil {
+			return nil, populateErr
 		}
 	}
 
-	ds, err := h.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
+	ds, err := f.IdentitySchema.URL(r.Context(), h.d.Config())
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +177,9 @@ func (h *Handler) NewRegistrationFlow(w http.ResponseWriter, r *http.Request, ft
 		return nil, err
 	}
 
+	span := trace.SpanFromContext(r.Context())
+	span.AddEvent(events.NewRegistrationInitiated(r.Context(), f.ID, string(ft), f.OrganizationID))
+
 	return f, nil
 }
 
@@ -177,6 +190,7 @@ func (h *Handler) FromOldFlow(w http.ResponseWriter, r *http.Request, of Flow) (
 	}
 
 	nf.RequestURL = of.RequestURL
+	nf.IdentitySchema = of.IdentitySchema
 	return nf, nil
 }
 
@@ -210,7 +224,7 @@ func (h *Handler) FromOldFlow(w http.ResponseWriter, r *http.Request, of Flow) (
 //	  200: registrationFlow
 //	  400: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) createNativeRegistrationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) createNativeRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	a, err := h.NewRegistrationFlow(w, r, flow.TypeAPI)
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
@@ -237,6 +251,19 @@ type createNativeRegistrationFlow struct {
 	//
 	// in: query
 	ReturnTo string `json:"return_to"`
+
+	// An optional organization ID that should be used to register this user.
+	// This parameter is only effective in the Ory Network.
+	//
+	// required: false
+	// in: query
+	Organization string `json:"organization"`
+
+	// An optional identity schema to use for the registration flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // Create Browser Registration Flow Parameters
@@ -274,9 +301,18 @@ type createBrowserRegistrationFlow struct {
 	// in: query
 	AfterVerificationReturnTo string `json:"after_verification_return_to"`
 
+	// An optional organization ID that should be used to register this user.
+	// This parameter is only effective in the Ory Network.
+	//
 	// required: false
 	// in: query
 	Organization string `json:"organization"`
+
+	// An optional identity schema to use for the registration flow.
+	//
+	// required: false
+	// in: query
+	IdentitySchema string `json:"identity_schema"`
 }
 
 // swagger:route GET /self-service/registration/browser frontend createBrowserRegistrationFlow
@@ -312,7 +348,7 @@ type createBrowserRegistrationFlow struct {
 //	  200: registrationFlow
 //	  303: emptyResponse
 //	  default: errorGeneric
-func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	a, err := h.NewRegistrationFlow(w, r, flow.TypeBrowser)
@@ -372,7 +408,7 @@ func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.R
 					h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to parse URL: %s", rt)))
 					return
 				}
-				x.AcceptToRedirectOrJSON(w, r, h.d.Writer(), err, returnTo.String())
+				x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), err, returnTo.String())
 				return
 			}
 
@@ -395,9 +431,9 @@ func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.R
 			return
 		}
 
-		returnTo, redirErr := x.SecureRedirectTo(r, h.d.Config().SelfServiceBrowserDefaultReturnTo(ctx),
-			x.SecureRedirectAllowSelfServiceURLs(h.d.Config().SelfPublicURL(ctx)),
-			x.SecureRedirectAllowURLs(h.d.Config().SelfServiceBrowserAllowedReturnToDomains(ctx)),
+		returnTo, redirErr := redir.SecureRedirectTo(r, h.d.Config().SelfServiceBrowserDefaultReturnTo(ctx),
+			redir.SecureRedirectAllowSelfServiceURLs(h.d.Config().SelfPublicURL(ctx)),
+			redir.SecureRedirectAllowURLs(h.d.Config().SelfServiceBrowserAllowedReturnToDomains(ctx)),
 		)
 		if redirErr != nil {
 			h.d.SelfServiceErrorManager().Forward(ctx, w, r, redirErr)
@@ -409,7 +445,7 @@ func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.R
 	}
 
 	redirTo := a.AppendTo(h.d.Config().SelfServiceFlowRegistrationUI(ctx)).String()
-	x.AcceptToRedirectOrJSON(w, r, h.d.Writer(), a, redirTo)
+	x.SendFlowCompletedAsRedirectOrJSON(w, r, h.d.Writer(), a, redirTo)
 }
 
 // Get Registration Flow Parameters
@@ -477,7 +513,7 @@ type getRegistrationFlow struct {
 //	  404: errorGeneric
 //	  410: errorGeneric
 //	  default: errorGeneric
-func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	if !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
 		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(ErrRegistrationDisabled))
 		return
@@ -493,7 +529,7 @@ func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request, ps
 	//
 	// Resolves: https://github.com/ory/kratos/issues/1282
 	if ar.Type == flow.TypeBrowser && !nosurf.VerifyToken(h.d.GenerateCSRFToken(r), ar.CSRFToken) {
-		h.d.Writer().WriteError(w, r, x.CSRFErrorReason(r, h.d))
+		h.d.Writer().WriteError(w, r, nosurfx.CSRFErrorReason(r, h.d))
 		return
 	}
 
@@ -501,13 +537,13 @@ func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request, ps
 		if ar.Type == flow.TypeBrowser {
 			redirectURL := flow.GetFlowExpiredRedirectURL(r.Context(), h.d.Config(), RouteInitBrowserFlow, ar.ReturnTo)
 
-			h.d.Writer().WriteError(w, r, errors.WithStack(x.ErrGone.WithID(text.ErrIDSelfServiceFlowExpired).
+			h.d.Writer().WriteError(w, r, errors.WithStack(nosurfx.ErrGone.WithID(text.ErrIDSelfServiceFlowExpired).
 				WithReason("The registration flow has expired. Redirect the user to the registration flow init endpoint to initialize a new registration flow.").
 				WithDetail("redirect_to", redirectURL.String()).
 				WithDetail("return_to", ar.ReturnTo)))
 			return
 		}
-		h.d.Writer().WriteError(w, r, errors.WithStack(x.ErrGone.WithID(text.ErrIDSelfServiceFlowExpired).
+		h.d.Writer().WriteError(w, r, errors.WithStack(nosurfx.ErrGone.WithID(text.ErrIDSelfServiceFlowExpired).
 			WithReason("The registration flow has expired. Call the registration flow init API endpoint to initialize a new registration flow.").
 			WithDetail("api", urlx.AppendPaths(h.d.Config().SelfPublicURL(r.Context()), RouteInitAPIFlow).String())))
 		return
@@ -614,7 +650,11 @@ type updateRegistrationFlowBody struct{}
 //	  410: errorGeneric
 //	  422: errorBrowserLocationChangeRequired
 //	  default: errorGeneric
-func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	ctx = semconv.ContextWithAttributes(ctx, attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "registration"))
+	r = r.WithContext(ctx)
+
 	rid, err := flow.GetFlowID(r)
 	if err != nil {
 		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, nil, node.DefaultGroup, err)
@@ -642,7 +682,7 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	i := identity.NewIdentity(h.d.Config().DefaultIdentityTraitsSchemaID(r.Context()))
+	i := identity.NewIdentity(f.IdentitySchema.ID(ctx, h.d.Config()))
 	var s Strategy
 	for _, ss := range h.d.AllRegistrationStrategies() {
 		if err := ss.Register(w, r, f, i); errors.Is(err, flow.ErrStrategyNotResponsible) {
